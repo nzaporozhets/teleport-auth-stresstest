@@ -19,7 +19,7 @@ source at this exact commit, not against assumptions from other
 versions. See [`docs/methodology.md`](docs/methodology.md) for how it's
 pinned and why.
 
-## Status: M0–M6 complete, M7 not started
+## Status: M0–M7 complete
 
 | Milestone | What | Status |
 |---|---|---|
@@ -30,7 +30,7 @@ pinned and why.
 | M4 | Ramp/breaking-point logic, generator saturation, Markdown report | Done |
 | M5 | Multi-pod sharding, aggregation command, Helm chart | Done |
 | M6 | Server-side scraping, pprof capture, Grafana dashboard, attribution | Done |
-| M7 | `local-login-totp`, `bot-join-renew`, `route-cert-issuance`, `mixed` scenarios | **Not started** |
+| M7 | `local-login-totp`, `bot-join-renew`, `route-cert-issuance`, `mixed` scenarios | Done |
 
 **Read this before trusting any acceptance-criteria claim below or in
 the milestone docs:** this codebase was built in a sandbox with no
@@ -57,7 +57,9 @@ cmd/
 internal/
   config/       YAML schema, validation, guardrails
   identity/     admin client, keypair pool, soft WebAuthn/TOTP authenticators
-  scenario/     Scenario interface + implementations (cert-renewal, local-login-webauthn)
+  scenario/     Scenario interface + all 6 implementations (cert-renewal,
+                local-login-webauthn, local-login-totp, bot-join-renew,
+                route-cert-issuance, mixed)
   driver/       open/closed-loop arrival control
   ramp/         step plan, abort criteria, knee detection, generator health
   collect/      HDR histograms, error taxonomy, cross-pod merge
@@ -114,8 +116,11 @@ bin/authload run -c config.yaml -y
 ```
 
 Runs the full ramp (warmup → step plan → JSON/Markdown report in
-`report.outputDir`). Only `load.scenario: cert-renewal` and
-`local-login-webauthn` are implemented (M7 adds the rest).
+`report.outputDir`). `load.scenario` may be any of `cert-renewal`,
+`local-login-webauthn`, `local-login-totp`, `bot-join-renew`,
+`route-cert-issuance`, or `mixed` — see
+[`docs/runbook.md`](docs/runbook.md#remaining-scenarios-m7) for each
+one's own config knobs and cluster prerequisites.
 
 ### 4. Multi-pod
 

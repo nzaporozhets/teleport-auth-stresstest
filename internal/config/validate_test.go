@@ -40,6 +40,121 @@ func TestLoadAndValidate_Broken(t *testing.T) {
 	}
 }
 
+// goodConfig loads testdata/good.yaml unvalidated, as a baseline for
+// tests that mutate one field and check Validate()'s reaction, without
+// re-declaring the whole schema inline or diluting M0's "5 deliberately
+// broken configs" acceptance criterion with unrelated cases.
+func goodConfig(t *testing.T) *Config {
+	t.Helper()
+	cfg, err := Load("testdata/good.yaml")
+	if err != nil {
+		t.Fatalf("Load(good.yaml): %v", err)
+	}
+	return cfg
+}
+
+func TestValidate_BotCountNegativeRejected(t *testing.T) {
+	cfg := goodConfig(t)
+	cfg.Fixtures.BotCount = -1
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "botCount") {
+		t.Errorf("expected a botCount error, got %v", err)
+	}
+}
+
+func TestValidate_BotCountZeroIsValid(t *testing.T) {
+	cfg := goodConfig(t)
+	cfg.Fixtures.BotCount = 0
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("botCount=0 (\"use the default\") should be valid, got %v", err)
+	}
+}
+
+func TestValidate_RouteCertIssuance(t *testing.T) {
+	cases := []struct {
+		name      string
+		mutate    func(*Config)
+		wantInErr string
+	}{
+		{
+			name: "bad route type",
+			mutate: func(c *Config) {
+				c.Load.RouteCertIssuance = RouteCertIssuance{RouteType: "ssh", Target: "x"}
+			},
+			wantInErr: "routeType",
+		},
+		{
+			name: "missing target",
+			mutate: func(c *Config) {
+				c.Load.RouteCertIssuance = RouteCertIssuance{RouteType: RouteTypeApp}
+			},
+			wantInErr: "target",
+		},
+		{
+			name: "database without protocol",
+			mutate: func(c *Config) {
+				c.Load.RouteCertIssuance = RouteCertIssuance{RouteType: RouteTypeDatabase, Target: "pg"}
+			},
+			wantInErr: "databaseProtocol",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := goodConfig(t)
+			cfg.Load.Scenario = ScenarioRouteCertIssuance
+			tc.mutate(cfg)
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), tc.wantInErr) {
+				t.Errorf("expected an error mentioning %q, got %v", tc.wantInErr, err)
+			}
+		})
+	}
+}
+
+func TestValidate_RouteCertIssuance_ValidDatabaseRoute(t *testing.T) {
+	cfg := goodConfig(t)
+	cfg.Load.Scenario = ScenarioRouteCertIssuance
+	cfg.Load.RouteCertIssuance = RouteCertIssuance{RouteType: RouteTypeDatabase, Target: "pg", DatabaseProtocol: "postgres"}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("expected a valid database route to pass, got %v", err)
+	}
+}
+
+func TestValidate_Mixed(t *testing.T) {
+	cases := []struct {
+		name      string
+		weights   map[ScenarioName]float64
+		wantInErr string
+	}{
+		{"too few", map[ScenarioName]float64{ScenarioCertRenewal: 1}, "at least two"},
+		{"unknown scenario", map[ScenarioName]float64{ScenarioCertRenewal: 1, "not-a-scenario": 1}, "not a scenario mixed can blend"},
+		{"nested mixed", map[ScenarioName]float64{ScenarioCertRenewal: 1, ScenarioMixed: 1}, "not a scenario mixed can blend"},
+		{"zero weight", map[ScenarioName]float64{ScenarioCertRenewal: 1, ScenarioLocalLoginWebAuthn: 0}, "must be > 0"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := goodConfig(t)
+			cfg.Load.Scenario = ScenarioMixed
+			cfg.Load.Mixed = Mixed{Weights: tc.weights}
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), tc.wantInErr) {
+				t.Errorf("expected an error mentioning %q, got %v", tc.wantInErr, err)
+			}
+		})
+	}
+}
+
+func TestValidate_Mixed_ValidWeights(t *testing.T) {
+	cfg := goodConfig(t)
+	cfg.Load.Scenario = ScenarioMixed
+	cfg.Load.Mixed = Mixed{Weights: map[ScenarioName]float64{
+		ScenarioCertRenewal:        1,
+		ScenarioLocalLoginWebAuthn: 3,
+	}}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("expected valid mixed weights to pass, got %v", err)
+	}
+}
+
 func TestValidate_AggregatesAllErrors(t *testing.T) {
 	cfg := &Config{} // everything empty
 	err := cfg.Validate()

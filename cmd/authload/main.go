@@ -97,8 +97,16 @@ func newScenario(name config.ScenarioName) (scenario.Scenario, error) {
 		return &scenario.CertRenewal{}, nil
 	case config.ScenarioLocalLoginWebAuthn:
 		return &scenario.LocalLoginWebAuthn{}, nil
+	case config.ScenarioLocalLoginTOTP:
+		return &scenario.LocalLoginTOTP{}, nil
+	case config.ScenarioBotJoinRenew:
+		return &scenario.BotJoinRenew{}, nil
+	case config.ScenarioRouteCertIssuance:
+		return &scenario.RouteCertIssuance{}, nil
+	case config.ScenarioMixed:
+		return &scenario.Mixed{}, nil
 	default:
-		return nil, fmt.Errorf("scenario %q is not yet implemented (see instructions.md milestone M7)", name)
+		return nil, fmt.Errorf("scenario %q is not a known scenario", name)
 	}
 }
 

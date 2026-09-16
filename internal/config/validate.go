@@ -91,6 +91,9 @@ func (c *Config) validateFixtures(v *ValidationError) {
 	default:
 		v.add("fixtures.keyPool.algorithm must be one of ecdsa|ed25519|rsa2048, got %q", c.Fixtures.KeyPool.Algorithm)
 	}
+	if c.Fixtures.BotCount < 0 {
+		v.add("fixtures.botCount must be >= 0 (0 means \"default to fixtures.userCount\")")
+	}
 }
 
 func (c *Config) validateLoad(v *ValidationError) {
@@ -157,6 +160,43 @@ func (c *Config) validateLoad(v *ValidationError) {
 	}
 	if g.MaxEphemeralConns <= 0 {
 		v.add("load.generatorLimits.maxEphemeralConns must be > 0")
+	}
+
+	if c.Load.Scenario == ScenarioRouteCertIssuance {
+		c.validateRouteCertIssuance(v)
+	}
+	if c.Load.Scenario == ScenarioMixed {
+		c.validateMixed(v)
+	}
+}
+
+func (c *Config) validateRouteCertIssuance(v *ValidationError) {
+	rc := c.Load.RouteCertIssuance
+	switch rc.RouteType {
+	case RouteTypeApp, RouteTypeDatabase, RouteTypeKubernetes:
+	default:
+		v.add("load.routeCertIssuance.routeType must be one of app|database|kubernetes, got %q", rc.RouteType)
+	}
+	if rc.Target == "" {
+		v.add("load.routeCertIssuance.target is required")
+	}
+	if rc.RouteType == RouteTypeDatabase && rc.DatabaseProtocol == "" {
+		v.add("load.routeCertIssuance.databaseProtocol is required when routeType is database")
+	}
+}
+
+func (c *Config) validateMixed(v *ValidationError) {
+	weights := c.Load.Mixed.Weights
+	if len(weights) < 2 {
+		v.add("load.mixed.weights must list at least two scenarios to blend")
+	}
+	for name, weight := range weights {
+		if !mixableScenarios[name] {
+			v.add("load.mixed.weights references %q, which is not a scenario mixed can blend (mixed cannot nest itself)", name)
+		}
+		if weight <= 0 {
+			v.add("load.mixed.weights[%q] must be > 0, got %v", name, weight)
+		}
 	}
 }
 

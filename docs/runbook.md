@@ -102,12 +102,14 @@ authload run -c scenarios/example.yaml       # prints pre-flight summary, genera
 authload run -c scenarios/example.yaml -y    # runs the full ramp, writes JSON/Markdown reports
 ```
 
-`load.scenario` must be `cert-renewal` (M2) or `local-login-webauthn`
-(M3); any other value fails fast in the pre-flight step, before touching
-fixtures or the cluster. `local-login-webauthn` needs
-`fixtures.secondFactor: webauthn`-seeded users in the fixture state (it
-skips any seeded user with a different second factor, and fails Setup if
-none match).
+`load.scenario` must be one of `cert-renewal`, `local-login-webauthn`,
+`local-login-totp`, `bot-join-renew`, `route-cert-issuance`, or `mixed`;
+any other value fails fast in the pre-flight step, before touching
+fixtures or the cluster. `local-login-webauthn`/`local-login-totp` each
+need fixture users seeded with the matching `fixtures.secondFactor`
+(they skip any seeded user with a different second factor, and fail
+Setup if none match) — see "Remaining scenarios (M7)" below for the
+other three.
 
 `authload run -y` (M4) runs the full step plan: warm up at
 `load.ramp.startRPS`, then each step at an increasing offered rate for
@@ -274,6 +276,74 @@ observability:
   during `authload run`, but a multi-pod aggregate report has no ranked
   causes (see docs/methodology.md's M6 notes for why).
 
+## Remaining scenarios (M7)
+
+- **`local-login-totp`** needs `fixtures.secondFactor: totp`-seeded
+  users. Domain constraint #1 applies literally: seed enough users that
+  `fixtures.userCount / offeredRPS` comfortably exceeds ~30s, or
+  Teleport will reject reused codes as replays — that failure looks like
+  a capacity problem in the report but is actually a fixture-sizing
+  problem. See docs/methodology.md's M7 notes.
+- **`bot-join-renew`** needs no `authseed apply` fixtures of its own
+  beyond the keypair pool (`fixtures.keyPool`) — it provisions its own
+  Bot resources and single-use join tokens directly in `Setup`, sized by
+  `fixtures.botCount` (defaults to `fixtures.userCount` if unset).
+  Prerequisites on the cluster side:
+  - The admin identity's role needs whatever grants Machine ID
+    administration (creating/upserting Bot resources and provisioning
+    tokens) — the builtin `Admin` role covers this; a narrower role
+    needs explicit access to the `bot` and `token` resource kinds.
+  - **This scenario's own runs leave `stress-bot-*` Bot resources behind
+    on every run** — `Teardown` has no admin connection available to
+    delete them with (see docs/methodology.md's M7 notes). Periodically
+    clean these up on a long-lived test cluster
+    (`tctl bots ls` / `tctl bots rm <name>`, or the equivalent
+    `BotServiceClient.DeleteBot` call), the same way you'd periodically
+    check for `stress-` users that a partial/aborted run didn't tear
+    down.
+  - Each renewal reconnects (see docs/methodology.md's M7 notes on the
+    generation counter) — `report-*.md`'s per-call latency for this
+    scenario therefore includes a fresh TLS handshake every time, unlike
+    `cert-renewal`'s reused-connection latency. Don't compare the two
+    scenarios' absolute latencies directly.
+- **`route-cert-issuance`** needs `load.routeCertIssuance` set:
+
+  ```yaml
+  load:
+    scenario: route-cert-issuance
+    routeCertIssuance:
+      routeType: database        # app | database | kubernetes
+      target: my-postgres        # app name / db service name / kube cluster name
+      databaseProtocol: postgres # required (and only used) when routeType: database
+  ```
+
+  Bootstrap has the same impersonation/RBAC/Admin-Action-MFA
+  preconditions as `cert-renewal` (see its section above) — Setup uses
+  the identical bootstrap path. This scenario only *requests* a
+  route-scoped certificate each call and discards it; it never connects
+  through the named app/database/Kubernetes cluster (instructions.md's
+  Scope: issuance is in scope, using the certificate is not).
+- **`mixed`** needs `load.mixed.weights`, naming at least two of the
+  other five scenarios (not `mixed` itself):
+
+  ```yaml
+  load:
+    scenario: mixed
+    mixed:
+      weights:
+        local-login-webauthn: 5
+        cert-renewal: 1
+        route-cert-issuance: 1
+  ```
+
+  `Setup` runs every weighted scenario's own `Setup` up front, so every
+  precondition above for whichever scenarios you blend applies
+  simultaneously (e.g. blending in `local-login-totp` needs
+  `totp`-seeded fixtures *in addition to* whatever the other blended
+  scenarios need). Each call picks one child scenario at random,
+  weighted by `weights`; over many calls, each child's share converges
+  to `weight / sum(weights)`.
+
 ## kind-based integration testing
 
 This repo has no bundled Teleport-on-Kubernetes manifests — provision a
@@ -329,7 +399,17 @@ require* — the sandbox this was built in has no Docker/kind/kubectl
 available (it does have Helm, used above for `helm lint`/`helm template`
 only), so none of M1's through M5's full acceptance criteria have been
 run. Each is checked at the unit level only, plus the live spot-check
-above for the pieces it touched:
+above for the pieces it touched. M7's three new scenarios beyond
+`local-login-totp` (`bot-join-renew`, `route-cert-issuance`, `mixed`)
+have **no** live-cluster verification at all, not even a spot-check —
+only unit-level guard-clause tests (matching `cert-renewal`'s own
+testing depth, for the same reason: exercising `Setup` end-to-end needs
+a live cluster and, for `bot-join-renew`, real Machine ID join support).
+In particular, `bot-join-renew`'s central claim — that reconnecting
+after every renewal is what keeps the generation counter in sync — is
+derived entirely from reading the pinned v17.7.29 source
+(`lib/auth/bot.go`), not from observing a real lock-out. Verify this
+against a real cluster before trusting it operationally:
 - M1 ("seeds 1,000 WebAuthn users against a kind-based Teleport cluster
   in under two minutes"): `internal/identity/*_test.go` verifies the soft
   WebAuthn/TOTP authenticators against the real
@@ -375,6 +455,18 @@ above for the pieces it touched:
   The Helm chart is verified with `helm lint`/`helm template` plus a
   YAML-parse round-trip in this sandbox; no `kubectl apply` or real Job
   scheduling has been tested.
+- M7 ("each [scenario] runs through the same pipeline with no
+  scenario-specific branching in the driver or reporter"): true by
+  construction — `internal/ramp`, `internal/driver`, and
+  `internal/report` were not modified at all for M7; every new scenario
+  is only a new `internal/scenario.Scenario` implementation plus a
+  `case` in `cmd/authload/main.go`'s `newScenario` (CLI wiring, not the
+  pipeline itself — see its comment). Not verified: the three claims
+  specific to each new scenario's own correctness (the TOTP-replay
+  fixture-sizing guidance, the route-scoped cert fields actually working
+  against a real cluster, and — most importantly — that
+  `bot-join-renew`'s reconnect-per-renewal actually keeps a real bot's
+  generation counter in sync rather than locking it).
 
-Re-run all five milestones' acceptance criteria against a real kind
-cluster before relying on any of these claims.
+Re-run all milestones' acceptance criteria against a real kind cluster
+before relying on any of these claims.

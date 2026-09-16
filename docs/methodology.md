@@ -7,10 +7,22 @@ lands; entries marked "pending" are not yet implemented.
 ## 1. TOTP cannot be replayed
 
 WebAuthn is the primary login scenario, implemented (M3) as
-`internal/scenario.LocalLoginWebAuthn`; TOTP (`local-login-totp`) is
-secondary and capped at roughly one login per user per ~30s window —
-*pending: M7*. The soft WebAuthn and TOTP authenticators (used for both
-seeding, M1, and login load, M3) live in
+`internal/scenario.LocalLoginWebAuthn`; TOTP
+(`internal/scenario.LocalLoginTOTP`, M7) is secondary and capped at
+roughly one login per user per ~30s window. This toolkit does not
+enforce that cap in code — `LocalLoginTOTP.Execute` round-robins over
+seeded TOTP users via the same atomic-counter pattern
+`LocalLoginWebAuthn` uses, with no per-user cooldown tracking — the
+operator is responsible for seeding enough TOTP users
+(`fixtures.userCount`) that the natural round-robin spacing at the
+offered rate exceeds the TOTP period (seededUsers / offeredRPS ≥ ~30s).
+Seed too few and Teleport will reject a reused code as a replay,
+surfacing as `ClientError`/`ServerError` in the report that looks like a
+capacity problem but is actually a fixture-sizing problem — this is
+exactly the "fake authentication failure" domain constraint #2 also
+warns about, just for a different root cause. The soft WebAuthn and TOTP
+authenticators (used for both seeding, M1, and login load, M3/M7) live
+in
 `internal/identity/webauthn_soft.go` and `internal/identity/totp_soft.go`;
 both are verified in tests against the real `github.com/go-webauthn/webauthn`
 (the same library Teleport's server uses) and `github.com/pquerna/otp`
@@ -435,6 +447,115 @@ validation (M0's guardrail-style "must be explicit" pattern).
   session's live spot-check) and assert the correct detector wins the
   ranking — this validates the ranking *logic*, not that these three
   failure modes are correctly detected on any specific real cluster.
+
+## M7 implementation notes
+
+- **`local-login-totp` is nearly a copy of `local-login-webauthn`, on
+  purpose.** The proxy web login wire types (`weblogin.go`) already had
+  `TOTPChallenge`/`TOTPCode` fields from M3 — verified against the
+  pinned source (`lib/web/apiserver.go`'s `mfaLoginBegin`/`mfaLoginFinish`
+  doc comments and `lib/client/weblogin.go`'s `AuthenticateSSHUserRequest.TOTPCode`)
+  before writing any new code, and no wire-format changes were needed.
+  The only real difference from `LocalLoginWebAuthn.Execute` is the
+  `mfa-solve` phase: computing `SoftTOTPDevice.Code(time.Now())` instead
+  of signing a WebAuthn assertion — still local, still no network, still
+  no keygen (domain constraint #4).
+- **`route-cert-issuance` reuses `cert-renewal`'s exact bootstrap
+  pattern** (`env.Admin.GenerateUserCerts` once per seeded user in
+  Setup, one long-lived `*apiclient.Client` per identity) — the only
+  difference is what `Execute` requests: a route-scoped
+  `UserCertsRequest` (`Usage`+`RouteToApp`/`RouteToDatabase`/
+  `KubernetesCluster`, verified field names against
+  `client/proto/authservice.pb.go`) built by the pure, unit-tested
+  `buildRouteCertsRequest` function, discarded immediately after —
+  "issuance only" per instructions.md's Scope section (using the
+  resulting cert to actually reach the app/database/Kubernetes cluster
+  is explicitly out of scope).
+- **`bot-join-renew`'s core finding: a renewed bot's connection must be
+  replaced, not reused, or the bot locks itself out after one renewal.**
+  Verified by reading `lib/auth/bot.go`'s `updateBotInstance` at the
+  pinned commit: token-joined bots carry a server-side generation
+  counter that increments on every successful renewal, and the *next*
+  renewal must present that new value via the certificate authenticating
+  the RPC — read from the live mTLS peer certificate, not from any field
+  in the request. Since a live gRPC/TLS connection's client certificate
+  cannot be swapped in place, `BotJoinRenew.Execute` reconnects
+  (`dialWithFreshCerts`) after every successful renewal, before
+  returning, and both the renewal RPC and the reconnect are counted in
+  the reported latency — hiding the reconnect cost would understate what
+  a real renewal cycle takes, and skipping it entirely (i.e. reusing one
+  connection like `cert-renewal` does) would lock every bot after its
+  first successful renewal on a live cluster. This matches real `tbot`
+  behavior, which also reconnects after each renewal. Discovered during
+  design, not by hitting it live — this sandbox never ran this scenario
+  against a real cluster (see docs/runbook.md's "not verified" list).
+- **`bot-join-renew`'s one-time join happens over the already-authenticated
+  admin connection, not a fresh unauthenticated one.** Real bots join
+  over an unauthenticated connection (no client cert yet); Teleport's
+  join RPC authorizes the request via the provisioning *token* itself,
+  not the caller's mTLS identity (confirmed by reading
+  `lib/auth/join.go`'s `RegisterUsingToken` — it never inspects the
+  caller's own certificate for anything but stripping untrusted
+  bot-instance-ID/generation hints), so calling it over `env.Admin`'s
+  existing connection in `Setup` works and avoids building a second,
+  separately-configured TLS dial path just for a one-time bootstrap step
+  — the same simplification `cert-renewal`'s Setup already makes by using
+  `env.Admin.GenerateUserCerts` (an authenticated call) to bootstrap.
+- **`bot-join-renew` provisions its own Bot resources and join tokens in
+  `Setup`, not via `authseed`.** The token join method deletes its token
+  immediately after a successful join (verified against source:
+  `generateCertsBot`'s `shouldDeleteToken = true` for
+  `JoinMethodToken`), so a token is single-use by construction — there
+  is nothing for `authseed apply` to seed ahead of time the way it seeds
+  reusable user credentials. `fixtures.botCount` (new in M7; defaults to
+  `fixtures.userCount` if unset) controls how many virtual bots get
+  provisioned this way.
+- **`bot-join-renew`'s `Teardown` cannot delete the Bot resources it
+  creates.** The `Scenario` interface's `Teardown(ctx) error` takes no
+  `Env`/`Admin` parameter (by design, matching the guardrail that the
+  admin identity is never referenced outside `Setup`), so there is no
+  admin connection available in `Teardown` to call `DeleteBot` with.
+  Every run of this scenario leaves its `stress-bot-*` Bot resources (and
+  their now-consumed, already-deleted join tokens) on the cluster —
+  operators should periodically prune them between runs. This is an
+  accepted, documented gap in the same spirit as the "retiring a
+  locked-out user... not implemented" note above, not an oversight.
+- **`mixed` is implemented entirely inside `internal/scenario`, with its
+  own small factory (`newSubScenario`) separate from
+  `cmd/authload/main.go`'s `newScenario`.** `Mixed` needs to construct
+  its weighted children from `load.mixed.weights` itself; putting that
+  factory in `cmd/authload` would either force an import cycle
+  (`internal/scenario` importing `cmd/authload`) or force
+  `cmd/authload` to know about `Mixed`'s internals. The two factories
+  answer different questions — `cmd/authload`'s picks the one scenario
+  `authload run` drives; `scenario.newSubScenario` picks what `Mixed`
+  itself is allowed to blend (deliberately excluding `mixed`, so it
+  can't nest itself) — and this split keeps the driver/ramp/report
+  packages exactly as scenario-agnostic as before: they see `Mixed` as
+  just another `Scenario`, satisfying M7's "no scenario-specific
+  branching in driver or reporter" acceptance criterion.
+- **`mixed`'s weighted selection is a small, separately unit-tested
+  type (`weightedPicker`), not inlined into `Mixed.Execute`.** Testing
+  the actual probability distribution needs many draws (the acceptance
+  test in `mixed_test.go` uses 100,000), which is easy to check against
+  a pure `[]float64 → int` function and awkward to check against
+  `Mixed` directly, since `Mixed.Setup` needs real (cluster-dependent)
+  child scenarios to construct anything at all. `Mixed`'s own tests stay
+  at the same guard-clause depth as `cert-renewal`/`route-cert-issuance`
+  for the same reason those stayed there: exercising a real weighted
+  blend end-to-end needs a live cluster satisfying every blended
+  scenario's own Setup preconditions simultaneously, which this sandbox
+  doesn't have.
+- **A subtlety worth naming, not fixing: blending scenarios that both
+  draw from the same keypair pool by array position (e.g. `cert-renewal`
+  and `bot-join-renew` together) can end up signing certs for two
+  different identities over the *same* underlying keypair.** This is
+  cryptographically harmless for a disposable load-test cluster (a
+  certificate is just a signature over a public key plus claims; nothing
+  requires a keypair be exclusive to one identity), so it's not treated
+  as a bug, but it does mean per-scenario pool usage isn't a reliable way
+  to reason about "how much of the pool did scenario X use" once
+  `mixed` is involved.
 
 ## Teleport version pin
 

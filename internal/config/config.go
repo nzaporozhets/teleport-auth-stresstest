@@ -77,6 +77,30 @@ var validScenarios = map[ScenarioName]bool{
 	ScenarioMixed:              true,
 }
 
+// mixableScenarios are the scenarios load.mixed.weights may reference.
+// Mixed itself is deliberately excluded — nesting a mixed blend inside
+// itself has no sensible semantics.
+var mixableScenarios = map[ScenarioName]bool{
+	ScenarioCertRenewal:        true,
+	ScenarioLocalLoginWebAuthn: true,
+	ScenarioLocalLoginTOTP:     true,
+	ScenarioBotJoinRenew:       true,
+	ScenarioRouteCertIssuance:  true,
+}
+
+// RouteType selects which kind of route-scoped certificate
+// route-cert-issuance requests. Certificate *issuance* for these routes
+// is in scope per instructions.md's Scope section; actually connecting
+// through them is not, which is why there's no corresponding client
+// code for any of the three beyond building the request.
+type RouteType string
+
+const (
+	RouteTypeApp        RouteType = "app"
+	RouteTypeDatabase   RouteType = "database"
+	RouteTypeKubernetes RouteType = "kubernetes"
+)
+
 // ReportFormat is an output format the report package can emit.
 type ReportFormat string
 
@@ -133,6 +157,17 @@ type Fixtures struct {
 	// instructions.md; added because M1 fixture seeding has no other way
 	// to hand seeded credentials to the load generator.
 	StatePath string `yaml:"statePath"`
+	// BotCount is how many virtual Machine ID bots bot-join-renew (M7)
+	// provisions, joins, and renews. Unlike Users, bots are not
+	// authseed-managed fixtures — instructions.md's join-method token is
+	// single-use (verified against v17.7.29 source: the token join
+	// method deletes its token immediately after a successful join), so
+	// bot-join-renew's own Setup creates one Bot resource and one
+	// provisioning token per virtual bot and consumes it there, rather
+	// than authseed provisioning something ahead of time that would sit
+	// unused. Defaults to UserCount if zero (0 is not itself a usable
+	// bot count, so this default is unambiguous).
+	BotCount int `yaml:"botCount"`
 }
 
 type KeyPool struct {
@@ -151,6 +186,31 @@ type LoadSpec struct {
 	// requires explicit thresholds to check the generator's own health
 	// against; there's no safe default we could silently apply instead.
 	GeneratorLimits GeneratorLimits `yaml:"generatorLimits"`
+	// RouteCertIssuance configures the "route-cert-issuance" scenario
+	// (M7); ignored by every other scenario.
+	RouteCertIssuance RouteCertIssuance `yaml:"routeCertIssuance"`
+	// Mixed configures the "mixed" scenario (M7); ignored otherwise.
+	Mixed Mixed `yaml:"mixed"`
+}
+
+// RouteCertIssuance is route-cert-issuance's own config, not part of
+// instructions.md's original sketch (added because the scenario needs
+// to know which route type/target to request a certificate for).
+type RouteCertIssuance struct {
+	RouteType RouteType `yaml:"routeType"`
+	// Target is the app name, database service name, or Kubernetes
+	// cluster name to route to, depending on RouteType.
+	Target string `yaml:"target"`
+	// DatabaseProtocol is required (and only used) when RouteType is
+	// "database" — RouteToDatabase.Protocol has no meaningful default.
+	DatabaseProtocol string `yaml:"databaseProtocol"`
+}
+
+// Mixed is the "mixed" scenario's own config: a weighted blend of the
+// other scenarios, weights from config (instructions.md's scenario
+// table). Keys must name another implemented, non-"mixed" scenario.
+type Mixed struct {
+	Weights map[ScenarioName]float64 `yaml:"weights"`
 }
 
 type Ramp struct {

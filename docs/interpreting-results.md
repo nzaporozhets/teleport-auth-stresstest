@@ -1,9 +1,10 @@
 # Interpreting results
 
 This document explains what each failure class in a report usually means
-and which cluster knob it points at. It will grow as the remaining
-scenarios (M7) land — for now it covers the taxonomy, ramp outcomes,
-report shape, and ranked attribution already implemented.
+and which cluster knob it points at. It covers the taxonomy, ramp
+outcomes, report shape, and ranked attribution — all scenario-agnostic
+and unchanged by which of the six implemented scenarios (M2/M3/M7)
+produced a given report.
 
 ## Outcome classes (`internal/scenario.Outcome`)
 
