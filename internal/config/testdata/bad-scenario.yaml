@@ -1,0 +1,55 @@
+target:
+  proxyAddr: teleport.loadtest.example.com:443
+  authAddr: ""
+  cluster: loadtest
+  guardrail:
+    requireClusterName: loadtest
+    confirmPhrase: "I am not in production"
+
+identity:
+  adminIdentityFile: /secrets/loadtest-admin.pem
+
+fixtures:
+  userCount: 5000
+  userPrefix: stress-
+  roles: [stress-access]
+  secondFactor: webauthn
+  statePath: ./results/fixtures.json
+  keyPool:
+    size: 10000
+    algorithm: ecdsa
+
+load:
+  scenario: nonexistent-scenario
+  model: open
+  arrival: poisson
+  ramp:
+    startRPS: 5
+    stepRPS: 5
+    stepDuration: 3m
+    warmup: 30s
+    settle: 15s
+    maxRPS: 1000
+  abort:
+    p99LatencyMs: 2000
+    errorRatePct: 1.0
+    throughputDeficitPct: 5
+    consecutiveBadSteps: 2
+
+observability:
+  listen: :9100
+  scrape:
+    - name: auth
+      url: https://teleport-auth.teleport.svc.cluster.local:3000/metrics
+      interval: 10s
+    - name: proxy
+      url: https://teleport-proxy.teleport.svc.cluster.local:3000/metrics
+      interval: 10s
+  pprof:
+    enabled: true
+    targets: [auth]
+    captureAtEachStep: true
+
+report:
+  outputDir: ./results
+  formats: [json, markdown]
