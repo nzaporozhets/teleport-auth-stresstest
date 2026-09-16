@@ -278,6 +278,63 @@ validation (M0's guardrail-style "must be explicit" pattern).
   `ramp` depends only on `collect`/`driver`, neither of which depends on
   `report`.
 
+## M5 implementation notes
+
+- **Sharding divides rate, not the abort-stop condition.** `--shard-count`
+  divides `load.ramp.startRPS`/`stepRPS`/`maxRPS`; `StepDuration`/
+  `Warmup`/`Settle` are unchanged (they're durations, not rates). But
+  a sharded pod's own `consecutiveBadSteps` early-stop is overridden to
+  effectively "never" (`cmd/authload/main.go`'s `runLoad`) — only the
+  fleet-wide aggregate's verdict matters when sharded, and letting one
+  noisy shard stop early would leave other pods' later steps with
+  nothing to merge against for that index. This doesn't change the
+  eventual breaking point: `ramp.DetermineOutcome`/`aggregate.Merge`
+  already just take the highest *passing* rate among however many steps
+  they're given, so extra trailing failing steps past the real knee
+  don't affect it — see `TestDetermineOutcome`.
+- **The shared start-at rendezvous only covers the step plan, not
+  Setup.** Each pod's scenario bootstrap (issuing certs, in
+  `cert-renewal`'s case) runs independently and as soon as it's ready;
+  only `ramp.Run` itself waits for `--start-at`. Bootstrap latency
+  varying between pods doesn't need coordinating — only the *measured*
+  step timing does.
+- **`ramp.StepReport` grew a `RawData collect.RawData` field** (the same
+  type `Collector.Export` produces) purely so a sharded pod can persist
+  the lossless histogram, not just the already-percentile-reduced
+  `Snapshot` — `runStep` calls `collector.Export` right before the
+  collector would otherwise be discarded. Single-pod callers (M2-M4)
+  simply ignore the new field; nothing about their behavior changed.
+- **User/keypair sharding is interleaved, not chunked** (`ShardUsers`,
+  `KeyPool.Shard`, `FixtureState.Shard`): pod `i` of `N` gets indices
+  `i, i+N, i+2N, ...`. This spreads an uneven remainder across pods
+  instead of piling it onto the last one, and — the actual reason it
+  matters — `FixtureState.Shard` applies the *same* interleaving to
+  `Users` and to the keypair pool's PEMs, so a scenario that pairs
+  `Users[i]` with keypool entry `i` 1:1 (`CertRenewal`) keeps that
+  pairing intact after sharding, without `CertRenewal` needing to know
+  sharding happened at all.
+- **The aggregate command re-evaluates, it doesn't vote.** A step's
+  fleet-wide `Pass`/`GeneratorLimited` is computed by feeding the
+  *merged* `Snapshot`/`GeneratorHealth` through the exact same
+  `ramp.EvaluateStep`/`GeneratorHealth.Exceeds` a live single-shard step
+  uses — not by ANDing/ORing each shard's own verdict. A fleet-wide
+  aggregate can cross a threshold no individual shard did on its own (or
+  the reverse), so per-shard verdicts alone wouldn't be sufficient.
+- **RBAC in the Helm chart is defense-in-depth, not a functional
+  requirement.** Pods get the admin identity and config via volume
+  mounts; nothing in this codebase calls the Kubernetes API. The
+  chart's `Role` grants `get` on exactly the two named resources anyway
+  (least privilege, and so a `kubectl exec`-based debugging session
+  using the pod's own token can't reach anything else in the namespace).
+- **The three Jobs (seed/load/aggregate) are not auto-sequenced by
+  Helm.** Hook-based Job ordering (`helm.sh/hook: post-install`, etc.)
+  is fragile for long-running Jobs (deletion policies, weight ordering,
+  no built-in "wait for completion" between hooks) — the chart instead
+  documents a manual three-step `helm template --show-only ... |
+  kubectl apply -f -` sequence in docs/runbook.md, matching the
+  three-step CLI flow (`authseed apply` / `authload run` /
+  `authload aggregate`) that already existed before this chart did.
+
 ## Teleport version pin
 
 Pinned to Teleport `v17.7.29` (commit `f11aeb122c9351028dd6e8c06b48094ab0dc91ee`).

@@ -1,0 +1,11 @@
+apiVersion: v2
+name: teleport-auth-stress
+description: >-
+  Harness chart for teleport-auth-stress (see instructions.md
+  "Distributed execution"): a single-pod authseed apply Job, an Indexed
+  Job of N authload pods sharing the offered rate and the seeded user
+  pool, and a single-pod authload aggregate Job that merges their raw
+  per-step data into one fleet-wide report.
+type: application
+version: 0.1.0
+appVersion: "0.1.0-dev"

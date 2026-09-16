@@ -113,6 +113,96 @@ is `"converged"` (with a `breakingPointRPS`), `"generator-limited"`, or
 and docs/methodology.md's M4 notes for exactly how generator-limited
 overrides an otherwise-passing step.
 
+## Multi-pod runs (M5)
+
+A single pod cannot generate enough TLS handshakes/logins to break a real
+auth service, and will hit per-IP rate limits first (instructions.md
+"Distributed execution"). `authload run` supports sharding directly:
+
+```
+authload run -c config.yaml -y \
+  --shard-index 3 --shard-count 8 \
+  --start-at 2026-01-01T00:00:00Z \
+  --results-dir /data/results/raw
+```
+
+- `--shard-count` divides `load.ramp.startRPS`/`stepRPS`/`maxRPS` by N;
+  `--shard-index` (0-based) picks this pod's disjoint slice of the seeded
+  user pool and keypair pool (`identity.FixtureState.Shard` — the same
+  user's index in `Users` and the same index in the keypair pool always
+  land in the same shard, preserving scenarios' 1:1 pairing, e.g.
+  `cert-renewal`). `--shard-index` defaults to `$JOB_COMPLETION_INDEX` if
+  unset, so a Kubernetes Indexed Job needs no per-pod templating at all.
+- `--start-at` is the shared wall-clock rendezvous: every pod waits until
+  this exact timestamp before its *step plan* begins (each pod's own
+  Setup/bootstrap still runs independently and as soon as it's ready).
+  There is no leader election and no runtime RPC between pods — every
+  pod is simply given the same value.
+- `--results-dir`, if set, makes the pod write its raw per-step HDR
+  histograms and counters there instead of writing its own final report.
+  When sharded, a pod also does **not** stop early on
+  `load.abort.consecutiveBadSteps` — it runs the full range up to
+  `load.ramp.maxRPS` unconditionally, because only the fleet-wide
+  aggregate's verdict matters; letting one noisy shard stop early would
+  leave other pods' later steps with nothing to merge against.
+
+Once every pod in the fleet has finished:
+
+```
+authload aggregate -c config.yaml --results-dir /data/results/raw
+```
+
+This reads every pod's raw step files, merges each step's HDR histograms
+losslessly (`internal/collect.MergeRaw` — merged percentiles are exact,
+not an average of each pod's own percentiles) and outcome counts, sums
+each step's offered rate back to the fleet-wide target, and
+re-evaluates `load.abort`/`load.generatorLimits` against the *merged*
+statistics — a fleet-wide aggregate can cross a threshold no individual
+shard did on its own, or vice versa, so this is not a simple AND/OR of
+each shard's verdict. It needs no cluster connection at all: this is
+why "a run can be re-analyzed without re-running load" — you can re-run
+just `authload aggregate` against the same `--results-dir` as many times
+as you want (e.g. after changing `load.abort` in the config to see how
+sensitive the breaking point is to it).
+
+### Kubernetes (Helm chart)
+
+`deploy/helm/teleport-auth-stress` has three Job templates — a
+single-pod seed Job, an `Indexed` load Job (`completions`/`parallelism`
+= `values.podCount`, giving every pod `$JOB_COMPLETION_INDEX`
+automatically), and a single-pod aggregate Job — all sharing one
+`ReadWriteMany` PVC (needs an RWX-capable storage class: NFS, EFS, Azure
+Files, Filestore, etc.) for `fixtures.statePath` and the raw results
+directory. `values.config` is the full teleport-auth-stress YAML,
+rendered verbatim into a ConfigMap and mounted identically into every
+pod — set `identity.adminIdentityFile`/`fixtures.statePath` in it to
+`/secrets/identity.pem`/`/data/fixtures.json` (or wherever you mount
+them) to match the chart's volume mounts. `values.adminIdentity` is the
+identity file's contents, mounted from a Secret. The chart does not
+auto-sequence the three Jobs (Helm hook ordering for long-running Jobs is
+fragile) — run them one at a time and wait for each to complete:
+
+```
+helm template loadtest deploy/helm/teleport-auth-stress -f my-values.yaml \
+  --show-only templates/job-seed.yaml | kubectl apply -f -
+# wait for it to complete
+helm template loadtest deploy/helm/teleport-auth-stress -f my-values.yaml \
+  --show-only templates/job-load.yaml | kubectl apply -f -
+# wait for all podCount completions
+helm template loadtest deploy/helm/teleport-auth-stress -f my-values.yaml \
+  --show-only templates/job-aggregate.yaml | kubectl apply -f -
+```
+
+Re-run `helm template`/`kubectl apply` for the load Job as many times as
+you want against the same seeded fixtures (each run gets a fresh
+`--start-at`, computed at render time) before re-running the seed Job.
+
+*Not verified against a real Kubernetes cluster in this sandbox* — `helm
+lint`/`helm template` both pass and the rendered YAML round-trips through
+a YAML parser cleanly (checked in this environment, which does have Helm
+but no cluster), but no `kubectl apply` or actual Job scheduling has been
+tested.
+
 ## kind-based integration testing
 
 This repo has no bundled Teleport-on-Kubernetes manifests — provision a
@@ -134,9 +224,10 @@ make kind-down
 ```
 
 *Not verified end-to-end in this repo's development environment* — the
-sandbox this was built in has no Docker/kind/kubectl available, so none
-of M1's, M2's, M3's, or M4's acceptance criteria have been run against a
-real cluster. Each is checked at the unit level only:
+sandbox this was built in has no Docker/kind/kubectl available (it does
+have Helm, used above for `helm lint`/`helm template` only), so none of
+M1's through M5's acceptance criteria have been run against a real
+cluster. Each is checked at the unit level only:
 - M1 ("seeds 1,000 WebAuthn users against a kind-based Teleport cluster
   in under two minutes"): `internal/identity/*_test.go` verifies the soft
   WebAuthn/TOTP authenticators against the real
@@ -168,6 +259,20 @@ real cluster. Each is checked at the unit level only:
   version of this test had during development). It does not and cannot
   verify the 15%-reproducibility claim itself, which is a statement about
   a real cluster's behavior under repeated load, not about this code.
+- M5 ("an 8-pod run produces one merged report whose aggregate
+  percentiles match a single-pod run at equivalent total rate within
+  10%"): `internal/collect/collect_test.go`'s
+  `TestExportMergeRaw_LosslessAgainstGroundTruth` proves the merge is
+  *exact* against a single collector fed the identical union of samples
+  directly (a stronger claim than "within 10%") — the only reason a real
+  multi-pod run wouldn't match a single-pod run at the same total rate
+  *exactly* is genuine measurement variance between separate processes
+  (scheduling, network path differences), not anything about the merge
+  math. `internal/aggregate/aggregate_test.go` verifies the fleet-wide
+  sum-of-offered-rates and re-evaluation-against-merged-stats behavior.
+  The Helm chart is verified with `helm lint`/`helm template` plus a
+  YAML-parse round-trip in this sandbox; no `kubectl apply` or real Job
+  scheduling has been tested.
 
-Re-run all four milestones' acceptance criteria against a real kind
+Re-run all five milestones' acceptance criteria against a real kind
 cluster before relying on any of these claims.

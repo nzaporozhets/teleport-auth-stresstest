@@ -136,6 +136,102 @@ func (c *Collector) Snapshot(offeredRPS float64, elapsed time.Duration) Snapshot
 	}
 }
 
+// RawData is a lossless, JSON-serializable export of a Collector's
+// state for one step, so a separate process (a different pod, or the
+// aggregate command re-analyzing a past run) can merge it with other
+// pods' exports of the same step. Outcomes is keyed by
+// scenario.Outcome.String() rather than the Outcome type itself, since
+// Outcome doesn't implement encoding/json's map-key marshaling — see
+// scenario.ParseOutcome for the reverse.
+type RawData struct {
+	OfferedRPS     float64          `json:"offeredRPS"`
+	HistogramBytes []byte           `json:"histogramBytes"`
+	Outcomes       map[string]int64 `json:"outcomes"`
+	Total          int64            `json:"total"`
+	Bytes          int64            `json:"bytes"`
+}
+
+// Export returns a lossless, mergeable snapshot of everything recorded
+// so far. offeredRPS is this Collector's own (e.g. one pod's shard of
+// the fleet-wide target), recorded so MergeRaw can sum it back into the
+// fleet-wide offered rate.
+func (c *Collector) Export(offeredRPS float64) (RawData, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	histBytes, err := c.hist.Encode(hdrhistogram.V2CompressedEncodingCookieBase)
+	if err != nil {
+		return RawData{}, fmt.Errorf("encoding histogram: %w", err)
+	}
+	outcomes := make(map[string]int64, len(c.outcomes))
+	for k, v := range c.outcomes {
+		outcomes[k.String()] = v
+	}
+	return RawData{
+		OfferedRPS:     offeredRPS,
+		HistogramBytes: histBytes,
+		Outcomes:       outcomes,
+		Total:          c.total,
+		Bytes:          c.bytes,
+	}, nil
+}
+
+// MergeRaw combines multiple pods' RawData exports of the *same step*
+// into one Snapshot. Percentiles are computed from the merged HDR
+// histogram itself, not averaged from each pod's individual
+// percentiles — HDR histograms merge losslessly, so this is the fleet's
+// true percentile, not an approximation of it. elapsed is the step's
+// nominal duration, shared across every pod by the step plan being
+// identical for all of them (instructions.md "Distributed execution") —
+// deliberately not derived from any single pod's own measured elapsed
+// time, which would just add that one pod's clock skew/scheduling noise
+// to the fleet-wide number.
+func MergeRaw(raws []RawData, elapsed time.Duration) (Snapshot, error) {
+	if len(raws) == 0 {
+		return Snapshot{}, fmt.Errorf("no raw data to merge")
+	}
+
+	merged := hdrhistogram.New(latencyFloorMicros, latencyCeilingMicros, significantFigures)
+	outcomes := make(map[scenario.Outcome]int64)
+	var offeredRPS float64
+	var total, bytesTotal int64
+
+	for i, r := range raws {
+		h, err := hdrhistogram.Decode(r.HistogramBytes)
+		if err != nil {
+			return Snapshot{}, fmt.Errorf("decoding histogram %d/%d: %w", i+1, len(raws), err)
+		}
+		merged.Merge(h)
+		offeredRPS += r.OfferedRPS
+		total += r.Total
+		bytesTotal += r.Bytes
+		for k, v := range r.Outcomes {
+			outcome, ok := scenario.ParseOutcome(k)
+			if !ok {
+				return Snapshot{}, fmt.Errorf("raw data %d/%d: unknown outcome %q", i+1, len(raws), k)
+			}
+			outcomes[outcome] += v
+		}
+	}
+
+	var achievedRPS float64
+	if elapsed > 0 {
+		achievedRPS = float64(total) / elapsed.Seconds()
+	}
+
+	return Snapshot{
+		OfferedRPS:  offeredRPS,
+		AchievedRPS: achievedRPS,
+		Total:       total,
+		Bytes:       bytesTotal,
+		Outcomes:    outcomes,
+		P50:         percentile(merged, 50),
+		P90:         percentile(merged, 90),
+		P99:         percentile(merged, 99),
+		P999:        percentile(merged, 99.9),
+	}, nil
+}
+
 func percentile(h *hdrhistogram.Histogram, p float64) time.Duration {
 	return time.Duration(h.ValueAtPercentile(p)) * time.Microsecond
 }

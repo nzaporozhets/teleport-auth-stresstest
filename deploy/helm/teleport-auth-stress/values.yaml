@@ -1,0 +1,60 @@
+# Default values for teleport-auth-stress.
+
+image:
+  # Build and push authload/authseed into one image (both binaries,
+  # matching cmd/authload and cmd/authseed) with your own CI, then set
+  # this. There is no published image for this project.
+  repository: ""
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# podCount is the number of authload pods in the load Job (N in
+# instructions.md's "Distributed execution": each gets targetRPS/N and a
+# disjoint slice of the seeded user pool — the chart doesn't compute
+# that split, cmd/authload's --shard-index/--shard-count flags do).
+podCount: 8
+
+# startDelaySeconds is added to the Helm render-time timestamp to
+# produce the --start-at value baked into every load-Job pod's args —
+# this is the "one start timestamp passed to every pod" mechanism
+# (instructions.md), computed once at `helm install`/`template` time, not
+# coordinated at runtime. Must be long enough for every pod to pull its
+# image and finish Setup (scenario bootstrap) before the deadline.
+startDelaySeconds: 120
+
+# config holds the full teleport-auth-stress YAML config (see
+# scenarios/example.yaml) as a literal block — rendered verbatim into a
+# ConfigMap and mounted identically into every pod, satisfying
+# "identical step plans" across the fleet. Fill this in per environment;
+# there is no safe default (same reasoning as the guardrail fields
+# themselves — see docs/methodology.md).
+config: ""
+
+# adminIdentity is the contents of the admin identity file (tctl auth
+# sign / a Machine ID bot identity — see docs/runbook.md's guidance on
+# using a bot identity to avoid Admin Action MFA at scale). Mounted
+# read-only from a Secret; never baked into the ConfigMap or image.
+adminIdentity: ""
+
+# sharedStorage configures the ReadWriteMany volume every pod (seed,
+# load, aggregate) mounts at /data, holding fixtures.statePath's output
+# and the raw per-step results directory. Needs a storage class that
+# supports RWX (e.g. NFS, EFS, Azure Files, Filestore) since load pods
+# run concurrently across possibly-different nodes.
+sharedStorage:
+  storageClassName: ""
+  size: 5Gi
+
+resources:
+  seed:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+  load:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+  aggregate:
+    requests:
+      cpu: 250m
+      memory: 256Mi

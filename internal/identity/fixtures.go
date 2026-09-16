@@ -128,3 +128,45 @@ func (s *FixtureState) KeyPool() (*KeyPool, error) {
 	}
 	return KeyPoolFromPairs(s.KeyPoolState.Algorithm, pairs), nil
 }
+
+// ShardUsers returns the disjoint slice of users assigned to pod
+// `index` out of `count` pods, interleaved the same way KeyPool.Shard
+// is, so a scenario's 1:1 pairing of a user with a keypool entry (e.g.
+// CertRenewal) stays consistent within one pod's shard.
+func ShardUsers(users []UserFixture, index, count int) []UserFixture {
+	if count <= 1 {
+		return users
+	}
+	var shard []UserFixture
+	for i := index; i < len(users); i += count {
+		shard = append(shard, users[i])
+	}
+	return shard
+}
+
+// Shard returns a FixtureState scoped to pod `index` out of `count`
+// pods: a disjoint slice of Users (via ShardUsers) and the matching
+// disjoint slice of the keypair pool's persisted private keys (the same
+// interleaving KeyPool.Shard uses), so a scenario that pairs users[i]
+// with keypool entry i 1:1 (e.g. CertRenewal) keeps that pairing intact
+// within one pod's shard. Scenario code is unaware this happened — it
+// just sees a FixtureState with fewer entries.
+func (s *FixtureState) Shard(index, count int) *FixtureState {
+	if count <= 1 {
+		return s
+	}
+	var pemShard [][]byte
+	for i := index; i < len(s.KeyPoolState.PrivateKeyPEMs); i += count {
+		pemShard = append(pemShard, s.KeyPoolState.PrivateKeyPEMs[i])
+	}
+	return &FixtureState{
+		ClusterName: s.ClusterName,
+		GeneratedAt: s.GeneratedAt,
+		UserPrefix:  s.UserPrefix,
+		Users:       ShardUsers(s.Users, index, count),
+		KeyPoolState: KeyPoolFixture{
+			Algorithm:      s.KeyPoolState.Algorithm,
+			PrivateKeyPEMs: pemShard,
+		},
+	}
+}

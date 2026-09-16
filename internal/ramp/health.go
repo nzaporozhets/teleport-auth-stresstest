@@ -47,10 +47,13 @@ func (h GeneratorHealth) Exceeds(t GeneratorThresholds) (bool, []string) {
 	return len(reasons) > 0, reasons
 }
 
-// worst combines two readings by taking the max of each field —
+// WorstHealth combines two readings by taking the max of each field —
 // used to summarize a step's worst moment rather than its average,
 // since a brief saturation spike is exactly what this exists to catch.
-func worst(a, b GeneratorHealth) GeneratorHealth {
+// Exported so the aggregate command (M5) can combine multiple pods'
+// per-step health the same way a single pod combines its own repeated
+// samples within one step.
+func WorstHealth(a, b GeneratorHealth) GeneratorHealth {
 	return GeneratorHealth{
 		CPUPercent:     maxFloat(a.CPUPercent, b.CPUPercent),
 		Goroutines:     maxInt(a.Goroutines, b.Goroutines),

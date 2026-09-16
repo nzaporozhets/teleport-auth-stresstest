@@ -139,6 +139,25 @@ func (p *KeyPool) At(i int) *KeyPair {
 // tests. Callers must not mutate it.
 func (p *KeyPool) Pairs() []*KeyPair { return p.pairs }
 
+// Shard returns the disjoint slice of this pool assigned to pod `index`
+// out of `count` pods (instructions.md "Distributed execution": each
+// generator pod gets "a disjoint slice of the seeded user pool"; the
+// same principle applies to the keypair pool so two pods never spend
+// admin-assisted bootstrap effort on the same keypair). Interleaved
+// (index, index+count, index+2*count, ...) rather than contiguous
+// chunks, so an uneven division spreads the remainder across pods
+// instead of piling it onto the last one.
+func (p *KeyPool) Shard(index, count int) *KeyPool {
+	if count <= 1 {
+		return p
+	}
+	var shard []*KeyPair
+	for i := index; i < len(p.pairs); i += count {
+		shard = append(shard, p.pairs[i])
+	}
+	return &KeyPool{Algorithm: p.Algorithm, pairs: shard}
+}
+
 // KeyPoolFromPairs reconstructs a KeyPool from previously-persisted
 // keypairs (fixtures.go LoadFixtureState).
 func KeyPoolFromPairs(algo config.KeyAlgorithm, pairs []*KeyPair) *KeyPool {

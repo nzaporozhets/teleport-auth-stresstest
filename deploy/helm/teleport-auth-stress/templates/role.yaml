@@ -1,0 +1,21 @@
+# Minimal, named-resource-scoped RBAC. Pods actually get the admin
+# identity and config via volume mounts (no API call needed at
+# runtime) — this Role exists so the service account has no more than
+# read access to exactly its own two resources, for defense in depth and
+# so an operator debugging via `kubectl exec` + the pod's own token can't
+# accidentally reach anything else in the namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "teleport-auth-stress.fullname" . }}
+  labels:
+    {{- include "teleport-auth-stress.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["{{ include "teleport-auth-stress.fullname" . }}-admin-identity"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["{{ include "teleport-auth-stress.fullname" . }}-config"]
+    verbs: ["get"]

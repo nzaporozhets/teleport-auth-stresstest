@@ -100,6 +100,100 @@ func TestCollector_ConcurrentAdd(t *testing.T) {
 	}
 }
 
+func TestExportMergeRaw_LosslessAgainstGroundTruth(t *testing.T) {
+	// Two "pods" record disjoint samples...
+	podA := New()
+	for i := 1; i <= 100; i++ {
+		podA.Add(time.Duration(i)*time.Millisecond, scenario.Success, 10)
+	}
+	podB := New()
+	for i := 101; i <= 250; i++ {
+		podB.Add(time.Duration(i)*time.Millisecond, scenario.Success, 10)
+	}
+	for i := 0; i < 5; i++ {
+		podB.Add(50*time.Millisecond, scenario.RateLimited, 0)
+	}
+
+	rawA, err := podA.Export(50)
+	if err != nil {
+		t.Fatalf("podA.Export: %v", err)
+	}
+	rawB, err := podB.Export(50)
+	if err != nil {
+		t.Fatalf("podB.Export: %v", err)
+	}
+
+	merged, err := MergeRaw([]RawData{rawA, rawB}, time.Second)
+	if err != nil {
+		t.Fatalf("MergeRaw: %v", err)
+	}
+
+	// ...and a single "ground truth" collector records the exact same
+	// union directly, with no export/merge round-trip.
+	truth := New()
+	for i := 1; i <= 100; i++ {
+		truth.Add(time.Duration(i)*time.Millisecond, scenario.Success, 10)
+	}
+	for i := 101; i <= 250; i++ {
+		truth.Add(time.Duration(i)*time.Millisecond, scenario.Success, 10)
+	}
+	for i := 0; i < 5; i++ {
+		truth.Add(50*time.Millisecond, scenario.RateLimited, 0)
+	}
+	want := truth.Snapshot(100, time.Second)
+
+	if merged.Total != want.Total {
+		t.Errorf("Total = %d, want %d", merged.Total, want.Total)
+	}
+	if merged.OfferedRPS != 100 { // 50 + 50, summed across pods
+		t.Errorf("OfferedRPS = %v, want 100 (sum of both pods' shards)", merged.OfferedRPS)
+	}
+	if merged.Bytes != want.Bytes {
+		t.Errorf("Bytes = %d, want %d", merged.Bytes, want.Bytes)
+	}
+	if merged.Outcomes[scenario.Success] != want.Outcomes[scenario.Success] {
+		t.Errorf("Success count = %d, want %d", merged.Outcomes[scenario.Success], want.Outcomes[scenario.Success])
+	}
+	if merged.Outcomes[scenario.RateLimited] != want.Outcomes[scenario.RateLimited] {
+		t.Errorf("RateLimited count = %d, want %d", merged.Outcomes[scenario.RateLimited], want.Outcomes[scenario.RateLimited])
+	}
+	// The core claim: percentiles from the merged histogram exactly
+	// match a histogram that recorded the same values directly — this is
+	// what "HDR histograms merge losslessly" means in practice, not an
+	// approximation.
+	if merged.P50 != want.P50 {
+		t.Errorf("P50 = %v, want %v (exact match, not approximate)", merged.P50, want.P50)
+	}
+	if merged.P90 != want.P90 {
+		t.Errorf("P90 = %v, want %v", merged.P90, want.P90)
+	}
+	if merged.P99 != want.P99 {
+		t.Errorf("P99 = %v, want %v", merged.P99, want.P99)
+	}
+	if merged.P999 != want.P999 {
+		t.Errorf("P999 = %v, want %v", merged.P999, want.P999)
+	}
+}
+
+func TestMergeRaw_RejectsEmptyInput(t *testing.T) {
+	if _, err := MergeRaw(nil, time.Second); err == nil {
+		t.Error("expected error merging zero RawData")
+	}
+}
+
+func TestMergeRaw_RejectsUnknownOutcome(t *testing.T) {
+	c := New()
+	c.Add(time.Millisecond, scenario.Success, 0)
+	raw, err := c.Export(10)
+	if err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+	raw.Outcomes["not-a-real-outcome"] = 1
+	if _, err := MergeRaw([]RawData{raw}, time.Second); err == nil {
+		t.Error("expected error merging an unrecognized outcome string")
+	}
+}
+
 func TestCollector_ClampsOutOfRangeLatency(t *testing.T) {
 	c := New()
 	// Negative/zero latency shouldn't happen in practice, but Add must

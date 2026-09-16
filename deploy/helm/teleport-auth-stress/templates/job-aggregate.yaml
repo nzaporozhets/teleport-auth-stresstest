@@ -1,0 +1,46 @@
+# Run after the load Job's podCount completions have all finished:
+#   helm template <release> deploy/helm/teleport-auth-stress -f values.yaml \
+#     --show-only templates/job-aggregate.yaml | kubectl apply -f -
+#
+# Reads every pod's raw per-step data from the same shared volume the
+# load Job wrote to and merges it into one fleet-wide report
+# (instructions.md: "The aggregation step is a separate command so a run
+# can be re-analyzed without re-running load") — no cluster connection
+# needed, so this doesn't mount the admin identity at all.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "teleport-auth-stress.fullname" . }}-aggregate
+  labels:
+    {{- include "teleport-auth-stress.labels" . | nindent 4 }}
+    app.kubernetes.io/component: aggregate
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        {{- include "teleport-auth-stress.labels" . | nindent 8 }}
+        app.kubernetes.io/component: aggregate
+    spec:
+      serviceAccountName: {{ include "teleport-auth-stress.fullname" . }}
+      restartPolicy: Never
+      containers:
+        - name: authload
+          image: {{ include "teleport-auth-stress.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["authload", "aggregate", "-c", "/config/config.yaml", "--results-dir", "/data/results/raw"]
+          resources:
+            {{- toYaml .Values.resources.aggregate | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "teleport-auth-stress.fullname" . }}-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "teleport-auth-stress.fullname" . }}-data

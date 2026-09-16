@@ -44,6 +44,28 @@ func (o Outcome) String() string {
 	}
 }
 
+// ParseOutcome is the inverse of String, for reading back an Outcome
+// persisted as its string form (e.g. internal/collect.RawData, written
+// by one pod and read by the aggregation command, M5).
+func ParseOutcome(s string) (Outcome, bool) {
+	switch s {
+	case "success":
+		return Success, true
+	case "lockout":
+		return Lockout, true
+	case "rate-limited":
+		return RateLimited, true
+	case "timeout":
+		return Timeout, true
+	case "server-error":
+		return ServerError, true
+	case "client-error":
+		return ClientError, true
+	default:
+		return 0, false
+	}
+}
+
 // Phase is a named sub-timing within one Execute call, e.g. dial, tls,
 // password, mfa, cert-issue.
 type Phase struct {

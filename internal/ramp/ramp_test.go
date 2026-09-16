@@ -169,7 +169,7 @@ func TestEvaluateStep(t *testing.T) {
 			c.Add(10*time.Millisecond, scenario.Success, 0)
 		}
 		snap := c.Snapshot(100, time.Second)
-		pass, reasons := evaluateStep(snap, abort)
+		pass, reasons := EvaluateStep(snap, abort)
 		if !pass {
 			t.Errorf("expected pass, got failures: %v", reasons)
 		}
@@ -181,7 +181,7 @@ func TestEvaluateStep(t *testing.T) {
 			c.Add(500*time.Millisecond, scenario.Success, 0)
 		}
 		snap := c.Snapshot(100, time.Second)
-		pass, reasons := evaluateStep(snap, abort)
+		pass, reasons := EvaluateStep(snap, abort)
 		if pass || len(reasons) == 0 {
 			t.Errorf("expected failure on p99 latency, got pass=%v reasons=%v", pass, reasons)
 		}
@@ -196,7 +196,7 @@ func TestEvaluateStep(t *testing.T) {
 			c.Add(10*time.Millisecond, scenario.Lockout, 0)
 		}
 		snap := c.Snapshot(100, time.Second)
-		pass, reasons := evaluateStep(snap, abort)
+		pass, reasons := EvaluateStep(snap, abort)
 		if !pass {
 			t.Errorf("a 50%% raw error rate that's entirely lockouts must still pass abort criteria, got reasons=%v", reasons)
 		}
@@ -208,9 +208,94 @@ func TestEvaluateStep(t *testing.T) {
 			c.Add(10*time.Millisecond, scenario.Success, 0)
 		}
 		snap := c.Snapshot(100, time.Second) // offered 100, achieved 50 -> 50% deficit
-		pass, reasons := evaluateStep(snap, abort)
+		pass, reasons := EvaluateStep(snap, abort)
 		if pass || len(reasons) == 0 {
 			t.Errorf("expected failure on throughput deficit, got pass=%v reasons=%v", pass, reasons)
 		}
 	})
+}
+
+func TestDetermineOutcome(t *testing.T) {
+	t.Run("converged: breaking point is the highest passing rate", func(t *testing.T) {
+		steps := []StepReport{
+			{OfferedRPS: 100, Pass: true},
+			{OfferedRPS: 200, Pass: true},
+			{OfferedRPS: 300, Pass: false},
+		}
+		result := DetermineOutcome(steps)
+		if result.Outcome != Converged {
+			t.Fatalf("Outcome = %v, want Converged", result.Outcome)
+		}
+		if result.BreakingPointRPS != 200 {
+			t.Errorf("BreakingPointRPS = %v, want 200", result.BreakingPointRPS)
+		}
+	})
+
+	t.Run("generator-limited overrides an otherwise-passing step, regardless of position", func(t *testing.T) {
+		steps := []StepReport{
+			{OfferedRPS: 100, Pass: true},
+			{OfferedRPS: 200, Pass: true, GeneratorLimited: true},
+			{OfferedRPS: 300, Pass: true},
+		}
+		result := DetermineOutcome(steps)
+		if result.Outcome != GeneratorLimited {
+			t.Fatalf("Outcome = %v, want GeneratorLimited", result.Outcome)
+		}
+		if result.Reason == "" {
+			t.Error("expected a non-empty Reason")
+		}
+	})
+
+	t.Run("inconclusive: no step ever passed", func(t *testing.T) {
+		steps := []StepReport{
+			{OfferedRPS: 100, Pass: false},
+			{OfferedRPS: 200, Pass: false},
+		}
+		result := DetermineOutcome(steps)
+		if result.Outcome != Inconclusive {
+			t.Fatalf("Outcome = %v, want Inconclusive", result.Outcome)
+		}
+		if result.BreakingPointRPS != 0 {
+			t.Errorf("BreakingPointRPS = %v, want 0", result.BreakingPointRPS)
+		}
+	})
+
+	t.Run("empty steps is inconclusive, not a panic", func(t *testing.T) {
+		result := DetermineOutcome(nil)
+		if result.Outcome != Inconclusive {
+			t.Errorf("Outcome = %v, want Inconclusive", result.Outcome)
+		}
+	})
+}
+
+func TestRun_StepReportCarriesRawData(t *testing.T) {
+	plan := Plan{StartRPS: 100, StepRPS: 100, StepDuration: 10 * time.Millisecond, MaxRPS: 100}
+	abort := AbortCriteria{P99LatencyMs: 1000, ErrorRatePct: 1, ThroughputDeficitPct: 50, ConsecutiveBadSteps: 1}
+
+	result, err := Run(context.Background(), plan, abort, GeneratorThresholds{}, driver.ArrivalUniform, alwaysSucceed, fakeHealthSampler{}, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(result.Steps) != 1 {
+		t.Fatalf("got %d steps, want 1", len(result.Steps))
+	}
+	raw := result.Steps[0].RawData
+	if len(raw.HistogramBytes) == 0 {
+		t.Error("RawData.HistogramBytes is empty, want a lossless HDR export")
+	}
+	if raw.OfferedRPS != 100 {
+		t.Errorf("RawData.OfferedRPS = %v, want 100", raw.OfferedRPS)
+	}
+	if raw.Outcomes["success"] == 0 {
+		t.Errorf("RawData.Outcomes = %+v, want a nonzero success count", raw.Outcomes)
+	}
+
+	// Prove it's actually mergeable via collect.MergeRaw, end to end.
+	merged, err := collect.MergeRaw([]collect.RawData{raw}, plan.StepDuration)
+	if err != nil {
+		t.Fatalf("MergeRaw: %v", err)
+	}
+	if merged.Total != result.Steps[0].Snapshot.Total {
+		t.Errorf("merged Total = %d, want %d (matching the live snapshot)", merged.Total, result.Steps[0].Snapshot.Total)
+	}
 }

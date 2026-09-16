@@ -1,0 +1,14 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "teleport-auth-stress.fullname" . }}
+  labels:
+    {{- include "teleport-auth-stress.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "teleport-auth-stress.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "teleport-auth-stress.fullname" . }}
+    namespace: {{ .Release.Namespace }}

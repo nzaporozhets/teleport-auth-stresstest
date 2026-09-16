@@ -31,10 +31,10 @@ func TestWorst_TakesMaxPerField(t *testing.T) {
 	a := GeneratorHealth{CPUPercent: 10, Goroutines: 100, OpenFDs: 5, EphemeralConns: 1}
 	b := GeneratorHealth{CPUPercent: 50, Goroutines: 20, OpenFDs: 50, EphemeralConns: 2}
 
-	got := worst(a, b)
+	got := WorstHealth(a, b)
 	want := GeneratorHealth{CPUPercent: 50, Goroutines: 100, OpenFDs: 50, EphemeralConns: 2}
 	if got != want {
-		t.Errorf("worst(a, b) = %+v, want %+v", got, want)
+		t.Errorf("WorstHealth(a, b) = %+v, want %+v", got, want)
 	}
 }
 

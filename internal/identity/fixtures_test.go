@@ -1,6 +1,7 @@
 package identity
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -124,5 +125,92 @@ func TestUserFixture_WrongSecondFactorRejected(t *testing.T) {
 	}
 	if _, err := u.TOTPDevice(); err == nil {
 		t.Error("expected error requesting TOTPDevice() for a none-second-factor user")
+	}
+}
+
+func TestShardUsers_DisjointAndComplete(t *testing.T) {
+	users := make([]UserFixture, 10)
+	for i := range users {
+		users[i] = UserFixture{Username: fmt.Sprintf("stress-%05d", i)}
+	}
+
+	const shardCount = 3
+	seen := make(map[string]int)
+	total := 0
+	for i := 0; i < shardCount; i++ {
+		shard := ShardUsers(users, i, shardCount)
+		total += len(shard)
+		for _, u := range shard {
+			seen[u.Username]++
+		}
+	}
+
+	if total != len(users) {
+		t.Errorf("sum of shard sizes = %d, want %d", total, len(users))
+	}
+	for name, count := range seen {
+		if count != 1 {
+			t.Errorf("user %s assigned to %d shards, want exactly 1", name, count)
+		}
+	}
+}
+
+func TestShardUsers_SinglePodReturnsAll(t *testing.T) {
+	users := []UserFixture{{Username: "a"}, {Username: "b"}}
+	shard := ShardUsers(users, 0, 1)
+	if len(shard) != len(users) {
+		t.Errorf("ShardUsers(users, 0, 1) returned %d users, want %d", len(shard), len(users))
+	}
+}
+
+func TestFixtureState_Shard_KeepsUserAndKeyPairingConsistent(t *testing.T) {
+	pool, err := GenerateKeyPool(config.KeyAlgorithmEd25519, 9)
+	if err != nil {
+		t.Fatalf("GenerateKeyPool: %v", err)
+	}
+	pemKeys := make([][]byte, pool.Size())
+	for i, kp := range pool.Pairs() {
+		pemKeys[i], err = kp.PrivateKeyPEM()
+		if err != nil {
+			t.Fatalf("PrivateKeyPEM: %v", err)
+		}
+	}
+
+	users := make([]UserFixture, 9)
+	for i := range users {
+		users[i] = UserFixture{Username: fmt.Sprintf("stress-%05d", i)}
+	}
+
+	full := &FixtureState{
+		ClusterName:  "loadtest",
+		Users:        users,
+		KeyPoolState: KeyPoolFixture{Algorithm: config.KeyAlgorithmEd25519, PrivateKeyPEMs: pemKeys},
+	}
+
+	const shardCount = 3
+	totalUsers, totalKeys := 0, 0
+	for i := 0; i < shardCount; i++ {
+		shard := full.Shard(i, shardCount)
+		if shard.ClusterName != "loadtest" {
+			t.Errorf("shard %d ClusterName = %q, want preserved value", i, shard.ClusterName)
+		}
+		if len(shard.Users) != len(shard.KeyPoolState.PrivateKeyPEMs) {
+			t.Errorf("shard %d has %d users but %d keys, want equal counts (1:1 pairing preserved)", i, len(shard.Users), len(shard.KeyPoolState.PrivateKeyPEMs))
+		}
+		totalUsers += len(shard.Users)
+		totalKeys += len(shard.KeyPoolState.PrivateKeyPEMs)
+	}
+	if totalUsers != len(users) {
+		t.Errorf("sum of shard user counts = %d, want %d", totalUsers, len(users))
+	}
+	if totalKeys != len(pemKeys) {
+		t.Errorf("sum of shard key counts = %d, want %d", totalKeys, len(pemKeys))
+	}
+}
+
+func TestFixtureState_Shard_SinglePodReturnsSelf(t *testing.T) {
+	full := &FixtureState{Users: []UserFixture{{Username: "a"}}}
+	if full.Shard(0, 1) != full {
+		t.Error("Shard(0, 1) should return the same FixtureState unchanged")
 	}
 }

@@ -1,0 +1,48 @@
+# Run once per fixture generation:
+#   helm template <release> deploy/helm/teleport-auth-stress -f values.yaml \
+#     --show-only templates/job-seed.yaml | kubectl apply -f -
+# Wait for it to complete before running the load Job — see
+# docs/runbook.md.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "teleport-auth-stress.fullname" . }}-seed
+  labels:
+    {{- include "teleport-auth-stress.labels" . | nindent 4 }}
+    app.kubernetes.io/component: seed
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        {{- include "teleport-auth-stress.labels" . | nindent 8 }}
+        app.kubernetes.io/component: seed
+    spec:
+      serviceAccountName: {{ include "teleport-auth-stress.fullname" . }}
+      restartPolicy: Never
+      containers:
+        - name: authseed
+          image: {{ include "teleport-auth-stress.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["authseed", "apply", "-c", "/config/config.yaml", "-y"]
+          resources:
+            {{- toYaml .Values.resources.seed | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+            - name: admin-identity
+              mountPath: /secrets
+              readOnly: true
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "teleport-auth-stress.fullname" . }}-config
+        - name: admin-identity
+          secret:
+            secretName: {{ include "teleport-auth-stress.fullname" . }}-admin-identity
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "teleport-auth-stress.fullname" . }}-data

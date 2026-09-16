@@ -71,6 +71,12 @@ type StepReport struct {
 	GeneratorLimited bool
 	Pass             bool
 	FailReasons      []string
+	// RawData is a lossless, mergeable export of this step's histogram
+	// and outcome counts (collect.Collector.Export) — carried here, not
+	// just the already-percentile-reduced Snapshot, so a sharded run
+	// (M5) can persist it for the aggregate command to losslessly merge
+	// with other pods' exports of the same step.
+	RawData collect.RawData
 }
 
 // Result is the whole ramp's outcome.
@@ -99,9 +105,6 @@ func Run(ctx context.Context, plan Plan, abort AbortCriteria, thresholds Generat
 
 	var steps []StepReport
 	consecutiveBad := 0
-	breakingPoint := 0.0
-	anyGeneratorLimited := false
-	anyPass := false
 
 	for rate, first := plan.StartRPS, true; rate <= plan.MaxRPS; rate, first = rate+plan.StepRPS, false {
 		discard := plan.Settle
@@ -123,23 +126,41 @@ func Run(ctx context.Context, plan Plan, abort AbortCriteria, thresholds Generat
 			onStep(report)
 		}
 
-		if report.GeneratorLimited {
-			anyGeneratorLimited = true
-		}
 		if report.Pass {
-			anyPass = true
-			breakingPoint = rate
 			consecutiveBad = 0
 		} else {
 			consecutiveBad++
 		}
-
 		if consecutiveBad >= abort.ConsecutiveBadSteps {
 			break
 		}
 	}
 
+	return DetermineOutcome(steps), nil
+}
+
+// DetermineOutcome computes the run-level Result from a completed list
+// of per-step reports, exactly as Run's own loop does. Exported so the
+// aggregate command (M5) can compute the identical run-level verdict
+// from merged multi-pod steps that were re-evaluated with EvaluateStep,
+// without duplicating this logic.
+func DetermineOutcome(steps []StepReport) *Result {
 	result := &Result{Steps: steps}
+
+	var anyGeneratorLimited, anyPass bool
+	var breakingPoint float64
+	for _, s := range steps {
+		if s.GeneratorLimited {
+			anyGeneratorLimited = true
+		}
+		if s.Pass {
+			anyPass = true
+			if s.OfferedRPS > breakingPoint {
+				breakingPoint = s.OfferedRPS
+			}
+		}
+	}
+
 	switch {
 	case anyGeneratorLimited:
 		result.Outcome = GeneratorLimited
@@ -151,7 +172,7 @@ func Run(ctx context.Context, plan Plan, abort AbortCriteria, thresholds Generat
 		result.Outcome = Converged
 		result.BreakingPointRPS = breakingPoint
 	}
-	return result, nil
+	return result
 }
 
 func runStep(ctx context.Context, rate float64, duration time.Duration, arrival driver.Arrival, task driver.Task, health HealthSampler, abort AbortCriteria, thresholds GeneratorThresholds) (StepReport, error) {
@@ -176,7 +197,12 @@ func runStep(ctx context.Context, rate float64, duration time.Duration, arrival 
 
 	snap := collector.Snapshot(rate, elapsed)
 	limited, healthReasons := worstHealth.Exceeds(thresholds)
-	pass, abortReasons := evaluateStep(snap, abort)
+	pass, abortReasons := EvaluateStep(snap, abort)
+
+	raw, err := collector.Export(rate)
+	if err != nil {
+		return StepReport{}, fmt.Errorf("exporting raw step data: %w", err)
+	}
 
 	return StepReport{
 		OfferedRPS:       rate,
@@ -185,6 +211,7 @@ func runStep(ctx context.Context, rate float64, duration time.Duration, arrival 
 		GeneratorLimited: limited,
 		Pass:             pass && !limited,
 		FailReasons:      append(abortReasons, healthReasons...),
+		RawData:          raw,
 	}, nil
 }
 
@@ -201,12 +228,19 @@ func pollHealth(ctx context.Context, health HealthSampler) GeneratorHealth {
 		case <-ctx.Done():
 			return result
 		case <-ticker.C:
-			result = worst(result, health.Sample())
+			result = WorstHealth(result, health.Sample())
 		}
 	}
 }
 
-func evaluateStep(snap collect.Snapshot, abort AbortCriteria) (bool, []string) {
+// EvaluateStep decides whether snap passes abort's thresholds. Exported
+// so the aggregate command (M5) can re-evaluate a merged multi-pod
+// Snapshot with the same logic a live single-shard step used — the
+// merged snapshot's stats (percentiles, error rate, achieved rate) are
+// what must be evaluated, not an AND/OR of each shard's own verdict,
+// since a fleet-wide aggregate can cross a threshold that no individual
+// shard did on its own (or vice versa).
+func EvaluateStep(snap collect.Snapshot, abort AbortCriteria) (bool, []string) {
 	var reasons []string
 
 	p99Ms := float64(snap.P99) / float64(time.Millisecond)

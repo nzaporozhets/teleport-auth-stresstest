@@ -1,0 +1,19 @@
+# Shared ReadWriteMany volume: fixtures.statePath (written once by the
+# seed Job) and the raw per-step results directory (written by every
+# load pod, read by the aggregate Job) both live here. Needs a storage
+# class that supports RWX across nodes — see values.yaml.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "teleport-auth-stress.fullname" . }}-data
+  labels:
+    {{- include "teleport-auth-stress.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - ReadWriteMany
+  {{- if .Values.sharedStorage.storageClassName }}
+  storageClassName: {{ .Values.sharedStorage.storageClassName }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.sharedStorage.size }}

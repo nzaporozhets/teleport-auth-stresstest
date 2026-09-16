@@ -107,3 +107,44 @@ func TestKeyPairFromPrivatePEM_MatchesOriginal(t *testing.T) {
 		t.Errorf("TLS public key mismatch after round-trip")
 	}
 }
+
+func TestKeyPool_Shard_DisjointAndComplete(t *testing.T) {
+	pool, err := GenerateKeyPool(config.KeyAlgorithmEd25519, 10)
+	if err != nil {
+		t.Fatalf("GenerateKeyPool: %v", err)
+	}
+
+	const shardCount = 3
+	seen := make(map[*KeyPair]int)
+	total := 0
+	for i := 0; i < shardCount; i++ {
+		shard := pool.Shard(i, shardCount)
+		total += shard.Size()
+		for _, kp := range shard.Pairs() {
+			seen[kp]++
+		}
+	}
+
+	if total != pool.Size() {
+		t.Errorf("sum of shard sizes = %d, want %d (every key assigned exactly once)", total, pool.Size())
+	}
+	for kp, count := range seen {
+		if count != 1 {
+			t.Errorf("key %p assigned to %d shards, want exactly 1", kp, count)
+		}
+	}
+	if len(seen) != pool.Size() {
+		t.Errorf("shards covered %d distinct keys, want all %d", len(seen), pool.Size())
+	}
+}
+
+func TestKeyPool_Shard_SinglePodReturnsWholePool(t *testing.T) {
+	pool, err := GenerateKeyPool(config.KeyAlgorithmEd25519, 5)
+	if err != nil {
+		t.Fatalf("GenerateKeyPool: %v", err)
+	}
+	shard := pool.Shard(0, 1)
+	if shard.Size() != pool.Size() {
+		t.Errorf("Shard(0, 1).Size() = %d, want %d (single pod gets everything)", shard.Size(), pool.Size())
+	}
+}

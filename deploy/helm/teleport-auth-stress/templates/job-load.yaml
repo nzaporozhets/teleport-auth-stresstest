@@ -1,0 +1,73 @@
+# Run after the seed Job completes:
+#   helm template <release> deploy/helm/teleport-auth-stress -f values.yaml \
+#     --show-only templates/job-load.yaml | kubectl apply -f -
+#
+# completionMode: Indexed (Kubernetes 1.21+) gives every pod a
+# JOB_COMPLETION_INDEX env var automatically — cmd/authload's
+# --shard-index flag defaults to that when unset, so no per-pod
+# templating is needed here at all: all podCount pods run from the
+# exact same PodSpec (instructions.md "identical step plans", "no leader
+# election, no runtime RPC between pods").
+#
+# --start-at is computed once, here, at `helm template`/`install` time —
+# every pod gets the same rendered value baked into its args. Make sure
+# startDelaySeconds comfortably exceeds how long the slowest pod takes to
+# schedule, pull its image, and finish scenario Setup (bootstrap), or
+# some pods will start late relative to others.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "teleport-auth-stress.fullname" . }}-load
+  labels:
+    {{- include "teleport-auth-stress.labels" . | nindent 4 }}
+    app.kubernetes.io/component: load
+spec:
+  completions: {{ .Values.podCount }}
+  parallelism: {{ .Values.podCount }}
+  completionMode: Indexed
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        {{- include "teleport-auth-stress.labels" . | nindent 8 }}
+        app.kubernetes.io/component: load
+    spec:
+      serviceAccountName: {{ include "teleport-auth-stress.fullname" . }}
+      restartPolicy: Never
+      containers:
+        - name: authload
+          image: {{ include "teleport-auth-stress.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - authload
+            - run
+            - -c
+            - /config/config.yaml
+            - -y
+            - --shard-count
+            - "{{ .Values.podCount }}"
+            - --start-at
+            - {{ now | dateModify (printf "+%ds" (int .Values.startDelaySeconds)) | date "2006-01-02T15:04:05Z07:00" | quote }}
+            - --results-dir
+            - /data/results/raw
+          resources:
+            {{- toYaml .Values.resources.load | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+            - name: admin-identity
+              mountPath: /secrets
+              readOnly: true
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "teleport-auth-stress.fullname" . }}-config
+        - name: admin-identity
+          secret:
+            secretName: {{ include "teleport-auth-stress.fullname" . }}-admin-identity
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "teleport-auth-stress.fullname" . }}-data

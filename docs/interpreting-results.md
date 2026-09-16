@@ -87,6 +87,20 @@ capacity or more pods," not as a finding about the cluster. A run's
 
 `outcomeReason` is populated for the latter two and explains which.
 
+## Multi-pod (aggregate) reports (M5)
+
+An `authload aggregate` report has the exact same shape as a single-pod
+one — same `meta`/`steps`/`outcome` fields, same Markdown layout. The
+differences are in how each step's numbers came to be: `offeredRPS` is
+the *sum* of every pod's own offered rate for that step (the fleet-wide
+target, not one pod's share of it), and every percentile comes from a
+single HDR histogram that every pod's own histogram was losslessly
+merged into — not an average of each pod's individual percentiles,
+which would not be the fleet's true percentile. `generatorHealth` is the
+worst reading across all pods for that step, so one saturated pod is
+enough to mark the whole step (and thus the whole run)
+`generatorLimited`, even if every other pod looked healthy.
+
 ## Coordinated omission
 
 Reports state which arrival model (`load.model`: `open` or `closed`) was
