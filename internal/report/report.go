@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"teleport-auth-stress/internal/attrib"
 	"teleport-auth-stress/internal/collect"
 	"teleport-auth-stress/internal/ramp"
 )
@@ -76,6 +77,12 @@ type Step struct {
 	GeneratorLimited  bool             `json:"generatorLimited"`
 	Pass              bool             `json:"pass"`
 	FailReasons       []string         `json:"failReasons,omitempty"`
+	// RankedCauses is populated only for failing, non-generator-limited
+	// steps (instructions.md's "Attribution" section: "for the failing
+	// steps, correlate ... and emit a ranked list of candidate limiting
+	// resources"). Highest-scored first; empty if attribution wasn't
+	// run (M2-M5 callers) or found no evidence either way.
+	RankedCauses []attrib.Candidate `json:"rankedCauses,omitempty"`
 }
 
 // StepFromSnapshot converts a collect.Snapshot into a report Step, with
@@ -242,7 +249,24 @@ func renderMarkdown(r *Report) string {
 	}
 
 	fmt.Fprintf(&b, "## Ranked limiting resources\n\n")
-	fmt.Fprintf(&b, "Pending M6 (server-side scraping and attribution).\n\n")
+	anyRanked := false
+	for _, s := range r.Steps {
+		if len(s.RankedCauses) == 0 {
+			continue
+		}
+		anyRanked = true
+		fmt.Fprintf(&b, "**Step at %.1f RPS:**\n\n", s.OfferedRPS)
+		for i, c := range s.RankedCauses {
+			fmt.Fprintf(&b, "%d. `%s` (score %.1f)\n", i+1, c.Name, c.Score)
+			for _, e := range c.Evidence {
+				fmt.Fprintf(&b, "   - %s\n", e)
+			}
+		}
+		b.WriteString("\n")
+	}
+	if !anyRanked {
+		fmt.Fprintf(&b, "No failing step had attribution data (either every step passed, attribution wasn't run, or no detector had enough evidence to score).\n\n")
+	}
 
 	fmt.Fprintf(&b, "## Reproduction\n\n```\n%s\n```\n", r.ReproCommand)
 

@@ -99,6 +99,18 @@ const healthSampleInterval = 500 * time.Millisecond
 // non-nil, is called synchronously after each step completes (for
 // progress logging).
 func Run(ctx context.Context, plan Plan, abort AbortCriteria, thresholds GeneratorThresholds, arrival driver.Arrival, task driver.Task, health HealthSampler, onStep func(StepReport)) (*Result, error) {
+	return RunWithHooks(ctx, plan, abort, thresholds, arrival, task, health, nil, onStep)
+}
+
+// RunWithHooks is Run with an additional onStepStart hook, called
+// synchronously right before each step's measured window begins (after
+// the warmup/settle discard, before the step's calls start) — e.g. to
+// kick off a concurrent pprof capture that needs to overlap the step's
+// steady state, which onStep (fired only at the step's end) is too late
+// for. Most callers want Run; this exists so M6's per-step pprof
+// capture doesn't need a wider, invasive signature change to the
+// commonly-used entry point.
+func RunWithHooks(ctx context.Context, plan Plan, abort AbortCriteria, thresholds GeneratorThresholds, arrival driver.Arrival, task driver.Task, health HealthSampler, onStepStart func(offeredRPS float64), onStep func(StepReport)) (*Result, error) {
 	if plan.StartRPS <= 0 || plan.StepRPS <= 0 || plan.MaxRPS <= 0 {
 		return nil, fmt.Errorf("ramp.Plan must have positive StartRPS, StepRPS, and MaxRPS")
 	}
@@ -115,6 +127,10 @@ func Run(ctx context.Context, plan Plan, abort AbortCriteria, thresholds Generat
 			if err := driver.RunOpenLoop(ctx, rate, arrival, discard, task, func(driver.Sample) {}); err != nil {
 				return nil, fmt.Errorf("discard window at %v rps: %w", rate, err)
 			}
+		}
+
+		if onStepStart != nil {
+			onStepStart(rate)
 		}
 
 		report, err := runStep(ctx, rate, plan.StepDuration, arrival, task, health, abort, thresholds)

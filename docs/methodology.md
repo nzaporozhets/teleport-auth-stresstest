@@ -347,6 +347,95 @@ validation (M0's guardrail-style "must be explicit" pattern).
   three-step CLI flow (`authseed apply` / `authload run` /
   `authload aggregate`) that already existed before this chart did.
 
+## M6 implementation notes
+
+- **Metric names were verified against the pinned v17.7.29 source, not
+  assumed from memory or Teleport's docs.** `internal/attrib/metrics.go`'s
+  constants each carry a file:line citation. Two surprises worth calling
+  out: `backend_read_seconds`/`backend_write_seconds`/
+  `backend_batch_read_seconds` have **no** `teleport_` prefix, unlike
+  almost every other Teleport metric (including their own sibling
+  `teleport_backend_atomic_write_condition_failed`); and
+  `grpc_server_handling_seconds` is conditional on cluster config, so
+  `BuildDetectors` treats it (and every metric) as optional, not assumed
+  present. There is verifiably **no** metric for password-hashing cost,
+  rate-limiter engagement, or proxy-to-auth saturation — confirmed by
+  reading the relevant source packages, not inferred from an absent
+  grep hit — which is exactly why `RateLimiterDetector` works off the
+  generator's own observed `RateLimited` outcome fraction instead of any
+  server-side signal.
+- **`RateLimiterDetector` is added exactly once by the caller, not by
+  `BuildDetectors`.** It needs no target-specific server metric at all
+  (Teleport's `lib/limiter` has zero Prometheus instrumentation — verified
+  against source, not just an absent metric name). `BuildDetectors` is
+  called once per scrape target (e.g. once for `"auth"`, once for
+  `"proxy"`); if it also added this detector, running it against two
+  targets would produce two identical `rate-limiter-engaged` candidates.
+  `cmd/authload/attribution.go`'s `setupAttribution` adds it once,
+  up front, regardless of how many scrape targets are configured.
+- **A step's "after" snapshot becomes the next step's "before" snapshot.**
+  `stepAttributor.onStep` (`cmd/authload/attribution.go`) only scrapes
+  once per step, at the step's end; there's no separate "before" scrape,
+  because the previous step's "after" *is* the right baseline — the gap
+  between them is exactly the settle/discard window the ramp already
+  discards. Only pprof capture genuinely needs a *start-of-step* signal
+  (to capture profile data during the step's steady state, not after it
+  ends), which is why `onStepStart` exists as a second, separate hook
+  alongside `onStep` — see `internal/ramp.RunWithHooks`.
+- **A generator-limited failing step is never ranked (domain constraint
+  #7).** `stepAttributor.onStep` has three branches: a passing step
+  becomes the new baseline; a generator-limited step is skipped entirely
+  (already surfaced via `generatorHealth`/`generatorLimited` in the
+  report — attributing a *cluster* cause to it would be actively
+  misleading); only a failing, non-generator-limited step is ranked
+  against the last passing baseline. See
+  `TestStepAttributor_WiringEndToEnd` in `cmd/authload/attribution_test.go`.
+- **Attribution degrades to "generator-only" if every scrape target is
+  unreachable, never to a fatal error.** `setupAttribution` logs a
+  warning and continues if a target can't be scraped at startup — a run
+  should never fail (or lose its own load-generation results) just
+  because a metrics endpoint was firewalled off or `diag_addr` wasn't
+  exposed. `rate-limiter-engaged` alone still works with zero server
+  metrics, so a report can still surface *that* finding even with no
+  scrape access at all — this matches the real live-cluster spot-check
+  (`docs/runbook.md`), where `/metrics` was loopback-only
+  (`diag_addr` default `127.0.0.1:3000`) and unreachable from outside the
+  auth pod.
+- **Grafana dashboards and detectors are both built from the same "what
+  actually exists" snapshot, not a fixed panel/detector list.**
+  `attrib.BuildGrafanaDashboard`/`BuildDetectors` both check
+  `Snapshot.Has(name)` before including a panel/detector, and both return
+  a warning string per skipped item naming exactly which metric was
+  missing — per instructions.md's "fail loudly with the list of missing
+  names," this is visible in run logs (`slog.Warn("attribution: "+w)`),
+  not a silently-degraded artifact. `deploy/grafana/example-*-dashboard.json`
+  are generated from a synthetic "every candidate metric present"
+  snapshot so the repo has a concrete example of the full 6-panel layout,
+  even though the real dashboard for any given cluster may have fewer
+  panels.
+- **Attribution doesn't span multi-pod aggregation yet.** `authload
+  aggregate` calls `writeReport` with a `nil` attributor — there's no
+  live scrape data associated with already-merged raw step files (each
+  pod's own attribution ran, if configured, during its own `authload run`,
+  against its own step boundaries, which don't line up 1:1 with the
+  aggregate's merged step list in general). A sharded run's per-pod
+  attribution still executes and is harmless, it's just not persisted
+  into `--results-dir` or re-surfaced by `aggregate` — a real scope gap,
+  not an oversight worth silently working around with per-pod files that
+  `aggregate` doesn't actually reconcile against each other.
+- **The three required M6 acceptance scenarios are unit tests against
+  synthetic evidence, not a live-cluster reproduction of CPU exhaustion,
+  a slowed backend, or an engaged rate limiter** (this sandbox has no way
+  to actually induce any of those three on a real cluster).
+  `internal/attrib/rank_test.go`'s `TestRank_CPULimitedAuth`/
+  `TestRank_SlowedBackend`/`TestRank_EngagedRateLimiter` construct
+  `StepEvidence` values with the exact before/after shapes each real
+  scenario would produce (e.g. `TestRank_EngagedRateLimiter` uses 84%
+  `RateLimited` outcomes, matching the real number observed in this
+  session's live spot-check) and assert the correct detector wins the
+  ranking — this validates the ranking *logic*, not that these three
+  failure modes are correctly detected on any specific real cluster.
+
 ## Teleport version pin
 
 Pinned to Teleport `v17.7.29` (commit `f11aeb122c9351028dd6e8c06b48094ab0dc91ee`).

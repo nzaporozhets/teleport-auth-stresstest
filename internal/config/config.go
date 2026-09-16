@@ -189,6 +189,17 @@ type ScrapeTarget struct {
 	Name     string        `yaml:"name"`
 	URL      string        `yaml:"url"`
 	Interval time.Duration `yaml:"interval"`
+	// Cores is this target's CPU limit/request (e.g. from its
+	// Kubernetes resource limits), used only to turn
+	// process_cpu_seconds_total into a utilization percentage for
+	// attribution's CPU-saturation detector. Not in instructions.md's
+	// original config sketch — added because there's no way to infer a
+	// process's CPU limit from its own metrics. Defaults to 1 if unset:
+	// attribution is a diagnostic aid, not a guardrail, so unlike
+	// load.generatorLimits this doesn't need to be mandatory — a wrong
+	// default just skews one detector's score, it doesn't silently
+	// disable a safety check.
+	Cores float64 `yaml:"cores"`
 }
 
 type Pprof struct {

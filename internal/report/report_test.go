@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"teleport-auth-stress/internal/attrib"
 	"teleport-auth-stress/internal/collect"
 	"teleport-auth-stress/internal/ramp"
 	"teleport-auth-stress/internal/scenario"
@@ -142,7 +143,14 @@ func TestWriteMarkdown(t *testing.T) {
 		Steps: []Step{
 			{OfferedRPS: 200, AchievedRPS: 200, Pass: true},
 			{OfferedRPS: 400, AchievedRPS: 380, Pass: true},
-			{OfferedRPS: 600, AchievedRPS: 300, Pass: false, FailReasons: []string{"p99 latency 5000.0ms exceeds threshold 2000.0ms"}},
+			{
+				OfferedRPS: 600, AchievedRPS: 300, Pass: false,
+				FailReasons: []string{"p99 latency 5000.0ms exceeds threshold 2000.0ms"},
+				RankedCauses: []attrib.Candidate{
+					{Name: "auth-cpu-saturation", Score: 91.7, Evidence: []string{"auth process CPU utilization 91.7% during the failing step"}},
+					{Name: "backend-latency", Score: 12.0, Evidence: []string{"auth backend avg latency slightly elevated"}},
+				},
+			},
 		},
 		Outcome:          "converged",
 		BreakingPointRPS: &bp,
@@ -165,6 +173,8 @@ func TestWriteMarkdown(t *testing.T) {
 		"Breaking point: **400.0 RPS**",
 		"p99 latency 5000.0ms exceeds threshold 2000.0ms",
 		"authload run -c scenarios/example.yaml -y",
+		"auth-cpu-saturation",
+		"auth process CPU utilization 91.7%",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("rendered markdown missing %q; got:\n%s", want, out)

@@ -227,6 +227,13 @@ func runLoad(configPath string, cfg *config.Config, shardIndex, shardCount int, 
 		}
 	}()
 
+	// Attribution setup (M6) happens once per pod, independent of the
+	// shared start-at clock — every pod scraping simultaneously right at
+	// go-time would be wasteful, and this doesn't need to be
+	// synchronized across pods the way the measured step plan does.
+	metricsClient := newMetricsClient(cfg.Target.InsecureSkipVerify)
+	attributor := newStepAttributor(metricsClient, cfg, setupAttribution(ctx, metricsClient, cfg))
+
 	// The shared wall-clock rendezvous applies to the measured step
 	// plan, not to Setup: every pod's (possibly slow, cert-issuing)
 	// bootstrap runs independently and as soon as it's ready, then all
@@ -286,20 +293,27 @@ func runLoad(configPath string, cfg *config.Config, shardIndex, shardCount int, 
 
 	startTime := time.Now().UTC()
 	stepIndex := 0
-	result, err := ramp.Run(ctx, plan, abort, thresholds, driver.Arrival(cfg.Load.Arrival), task, ramp.NewOSHealthSampler(), func(s ramp.StepReport) {
-		slog.Info("step complete", "shardIndex", shardIndex, "offeredRPS", s.OfferedRPS, "achievedRPS", s.Snapshot.AchievedRPS, "pass", s.Pass, "generatorLimited", s.GeneratorLimited, "failReasons", s.FailReasons)
-		if resultsDir != "" {
-			if err := aggregate.WriteRawStep(resultsDir, aggregate.RawStep{
-				StepIndex:  stepIndex,
-				ShardIndex: shardIndex,
-				Data:       s.RawData,
-				Health:     s.Health,
-			}); err != nil {
-				slog.Warn("writing raw step data failed", "error", err)
+	result, err := ramp.RunWithHooks(ctx, plan, abort, thresholds, driver.Arrival(cfg.Load.Arrival), task, ramp.NewOSHealthSampler(),
+		attributor.onStepStart,
+		func(s ramp.StepReport) {
+			slog.Info("step complete", "shardIndex", shardIndex, "offeredRPS", s.OfferedRPS, "achievedRPS", s.Snapshot.AchievedRPS, "pass", s.Pass, "generatorLimited", s.GeneratorLimited, "failReasons", s.FailReasons)
+			if resultsDir != "" {
+				if err := aggregate.WriteRawStep(resultsDir, aggregate.RawStep{
+					StepIndex:  stepIndex,
+					ShardIndex: shardIndex,
+					Data:       s.RawData,
+					Health:     s.Health,
+				}); err != nil {
+					slog.Warn("writing raw step data failed", "error", err)
+				}
 			}
-		}
-		stepIndex++
-	})
+			// Attribution ranking currently only feeds the single-pod
+			// report below, not the multi-pod aggregate command — a
+			// sharded run's attribution still runs (harmless) but its
+			// ranked causes aren't persisted to resultsDir yet.
+			attributor.onStep(ctx, s)
+			stepIndex++
+		})
 	if err != nil {
 		return fmt.Errorf("ramp: %w", err)
 	}
@@ -312,10 +326,15 @@ func runLoad(configPath string, cfg *config.Config, shardIndex, shardCount int, 
 
 	// Single-pod (or sharded-without---results-dir) mode: this pod's own
 	// result is the final report.
-	return writeReport(cfg, configPath, result, startTime, clusterName, serverVersion, shardIndex, shardCount)
+	return writeReport(cfg, configPath, result, startTime, clusterName, serverVersion, shardIndex, shardCount, attributor)
 }
 
-func writeReport(cfg *config.Config, reproTarget string, result *ramp.Result, startTime time.Time, clusterName, serverVersion string, shardIndex, shardCount int) error {
+// writeReport builds and writes the final report. attributor is nil for
+// authload aggregate, which has no live scrape data to rank with (it
+// re-evaluates abort/generator criteria against merged data, but
+// ranked-cause attribution doesn't yet span multi-pod aggregation — see
+// docs/methodology.md's M6 notes).
+func writeReport(cfg *config.Config, reproTarget string, result *ramp.Result, startTime time.Time, clusterName, serverVersion string, shardIndex, shardCount int, attributor *stepAttributor) error {
 	r := report.FromRampResult(result, report.Meta{
 		HarnessVersion:  report.HarnessVersion,
 		GitSHA:          report.GitSHA(),
@@ -326,6 +345,12 @@ func writeReport(cfg *config.Config, reproTarget string, result *ramp.Result, st
 		TeleportVersion: serverVersion,
 		ClusterName:     clusterName,
 	}, reproTarget)
+
+	if attributor != nil {
+		for i := range r.Steps {
+			r.Steps[i].RankedCauses = attributor.rankedFor(i)
+		}
+	}
 
 	stamp := startTime.Format("20060102T150405Z")
 	suffix := ""
@@ -401,7 +426,7 @@ func runAggregate(args []string) int {
 		return 1
 	}
 
-	if err := writeReport(cfg, fmt.Sprintf("authload aggregate -c %s --results-dir %s", *path, *resultsDir), result, time.Now().UTC(), "", "", 0, 1); err != nil {
+	if err := writeReport(cfg, fmt.Sprintf("authload aggregate -c %s --results-dir %s", *path, *resultsDir), result, time.Now().UTC(), "", "", 0, 1, nil); err != nil {
 		fmt.Fprintf(os.Stderr, "aggregate failed: %v\n", err)
 		return 1
 	}

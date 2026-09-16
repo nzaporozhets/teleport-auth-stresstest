@@ -299,3 +299,31 @@ func TestRun_StepReportCarriesRawData(t *testing.T) {
 		t.Errorf("merged Total = %d, want %d (matching the live snapshot)", merged.Total, result.Steps[0].Snapshot.Total)
 	}
 }
+
+func TestRunWithHooks_OnStepStartFiresBeforeEachStep(t *testing.T) {
+	plan := Plan{StartRPS: 100, StepRPS: 100, StepDuration: 10 * time.Millisecond, MaxRPS: 200}
+	abort := AbortCriteria{P99LatencyMs: 1000, ErrorRatePct: 1, ThroughputDeficitPct: 50, ConsecutiveBadSteps: 99}
+
+	var starts, completions []float64
+	_, err := RunWithHooks(context.Background(), plan, abort, GeneratorThresholds{}, driver.ArrivalUniform, alwaysSucceed, fakeHealthSampler{},
+		func(rate float64) { starts = append(starts, rate) },
+		func(s StepReport) { completions = append(completions, s.OfferedRPS) },
+	)
+	if err != nil {
+		t.Fatalf("RunWithHooks: %v", err)
+	}
+	if len(starts) != 2 || starts[0] != 100 || starts[1] != 200 {
+		t.Errorf("onStepStart saw %v, want [100 200]", starts)
+	}
+	if len(completions) != 2 {
+		t.Errorf("onStep saw %v, want 2 completions", completions)
+	}
+	// onStepStart for a step must fire before that same step's onStep.
+	if len(starts) == len(completions) {
+		for i := range starts {
+			if starts[i] != completions[i] {
+				t.Errorf("step %d: onStepStart rate %v != onStep rate %v", i, starts[i], completions[i])
+			}
+		}
+	}
+}

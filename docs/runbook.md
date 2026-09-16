@@ -218,6 +218,62 @@ a YAML parser cleanly (checked in this environment, which does have Helm
 but no cluster), but no `kubectl apply` or actual Job scheduling has been
 tested.
 
+## Attribution: server-side scraping, pprof, Grafana dashboards (M6)
+
+Add `observability.scrape` entries pointing at each Teleport process's
+metrics endpoint to get ranked candidate causes for failing steps in the
+report, plus a generated Grafana dashboard per target:
+
+```yaml
+observability:
+  scrape:
+    - name: auth
+      url: https://auth.internal:3000/metrics
+      cores: 2          # optional: matches this process's CPU limit/request;
+                         # defaults to 1 if omitted (only skews the
+                         # CPU-saturation score, not a safety check)
+    - name: proxy
+      url: https://proxy.internal:3000/metrics
+      cores: 2
+  pprof:
+    enabled: true
+    targets: [auth]      # must name a target above
+    captureAtEachStep: true
+```
+
+- **`observability.scrape[].url` must be reachable from wherever
+  `authload run` runs** — usually not the public proxy address.
+  Teleport's `/metrics` and `/debug/pprof/*` are served on `diag_addr`,
+  which **defaults to loopback (`127.0.0.1:3000`) and is not exposed
+  externally** unless you've explicitly configured
+  `diag_addr`/`prometheus_addr`/an equivalent Helm value to bind
+  elsewhere or expose it via a Service. Confirmed against a live
+  cluster in this session: `/metrics` was unreachable from outside the
+  auth pod with the default config. If every scrape target is
+  unreachable, `authload run` still runs and still reports
+  `rate-limiter-engaged` findings (the one detector needing no server
+  metric) — it just skips server-side detectors/dashboards for that run
+  and logs a warning per target, rather than failing.
+- **Attribution never blocks or fails a run.** A scrape failure, a
+  missing metric, or a dashboard-write error all log at `WARN` and are
+  skipped — this is a diagnostic aid layered on top of the load test,
+  not part of its pass/fail logic.
+- **What you get in `report.outputDir`**: `grafana-<target>-dashboard.json`
+  per reachable scrape target (import directly into Grafana — only
+  panels whose underlying metric actually exists on this cluster/version
+  are included, with a startup warning naming any panel that was
+  skipped), and, if `pprof.enabled`, `pprof-<target>-step<N>.pb.gz` per
+  step per pprof target (`go tool pprof pprof-auth-step3.pb.gz`).
+  See `deploy/grafana/example-*-dashboard.json` for what the full
+  (all-metrics-present) 6-panel layout looks like.
+- **Ranked causes live in the report itself**, under each failing step —
+  see docs/interpreting-results.md's "Ranked limiting resources" section
+  for what a candidate's score/evidence mean and which failure modes are
+  and aren't currently detectable this way.
+- **Not yet wired into `authload aggregate`**: attribution runs per-pod
+  during `authload run`, but a multi-pod aggregate report has no ranked
+  causes (see docs/methodology.md's M6 notes for why).
+
 ## kind-based integration testing
 
 This repo has no bundled Teleport-on-Kubernetes manifests — provision a

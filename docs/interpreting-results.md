@@ -2,8 +2,8 @@
 
 This document explains what each failure class in a report usually means
 and which cluster knob it points at. It will grow as the remaining
-scenarios (M7) and attribution (M6) land — for now it covers the
-taxonomy, ramp outcomes, and report shape already implemented.
+scenarios (M7) land — for now it covers the taxonomy, ramp outcomes,
+report shape, and ranked attribution already implemented.
 
 ## Outcome classes (`internal/scenario.Outcome`)
 
@@ -100,6 +100,63 @@ which would not be the fleet's true percentile. `generatorHealth` is the
 worst reading across all pods for that step, so one saturated pod is
 enough to mark the whole step (and thus the whole run)
 `generatorLimited`, even if every other pod looked healthy.
+
+## Ranked limiting resources (M6)
+
+A failing, non-generator-limited step's report entry carries
+`rankedCauses`: candidate cluster-side explanations, sorted by score
+descending, each with a `name`, a `score`, and `evidence` bullets citing
+the actual metric values that produced it. This is attribution, not
+proof — it correlates before/after server metric snapshots (from
+`observability.scrape`) and the step's own generator-side outcome mix
+against a small set of known failure signatures, per instructions.md's
+"Attribution" requirement. Absent entirely (`rankedCauses` omitted) means
+either the step passed, it was generator-limited (deliberately not
+ranked — see below), or no scrape targets were reachable/configured.
+
+Current detectors and what each one actually means if it's top-ranked:
+
+- **`<target>-cpu-saturation`** — `process_cpu_seconds_total` delta over
+  the step's wall time, divided by `observability.scrape[].cores`,
+  crossed a high-utilization threshold. Points at: that process (auth or
+  proxy) is CPU-bound — the login/cert-issuance work itself (WebAuthn
+  signature verification, password hashing, cert signing), not something
+  downstream.
+- **`<target>-backend-latency`** — `backend_read_seconds`/
+  `backend_write_seconds` (note: no `teleport_` prefix, unlike most other
+  metrics) average latency grew relative to baseline (or, with no
+  baseline available, crossed an absolute-ms threshold). Points at: the
+  backend store (etcd/DynamoDB/Firestore/etc.), not the Teleport process
+  itself — check its own capacity/throttling, not auth/proxy CPU.
+- **`<target>-goroutine-growth`** — `go_goroutines` grew well beyond
+  baseline. Points at: work piling up faster than it's being drained
+  (a queue backing up somewhere in that process) — often a precursor to,
+  or co-occurring with, CPU saturation or backend latency, worth
+  correlating with both before concluding it's an independent cause.
+- **`<target>-cache-staleness`** — `teleport_cache_stale_events` grew
+  relative to `teleport_cache_events`. Per that metric's own Help text,
+  "a high percentage of stale events can indicate a degraded backend" —
+  effectively a second, independent signal pointing at the same backend
+  as `backend-latency`, useful when read/write latency metrics aren't
+  present on a given version but this one is.
+- **`rate-limiter-engaged`** — the step's own generator-side outcome mix
+  was dominated by `RateLimited`. Needs no server metric at all: verified
+  against source, Teleport's per-IP login-endpoint limiter
+  (`lib/limiter`) has zero Prometheus instrumentation, so this is the
+  only detector that works with no `observability.scrape` configured or
+  reachable at all. Points at: your generator's source-IP diversity, not
+  cluster capacity — see docs/runbook.md's rate-limiter note; this is
+  *not* a cluster bottleneck finding, and a high score here suggests the
+  run's breaking point is an artifact of your own pod topology.
+
+**Known gaps, not oversights**: there is no detector for password-hashing
+cost, admin-action-MFA overhead, or proxy-to-auth-connection saturation —
+verified against source that no Prometheus metric exists for any of
+these on the pinned version, so no detector could be built without
+inventing a proxy metric that doesn't reflect anything real. If one of
+these is actually your bottleneck, it won't show up in `rankedCauses` at
+all; don't read an empty/low-scoring list as proof the cluster wasn't the
+problem.
 
 ## Coordinated omission
 

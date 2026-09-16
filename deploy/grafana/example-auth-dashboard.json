@@ -1,0 +1,156 @@
+{
+  "title": "teleport-auth-stress: auth",
+  "schemaVersion": 39,
+  "panels": [
+    {
+      "id": 1,
+      "title": "auth: CPU utilization",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(process_cpu_seconds_total{job=\"auth\"}[1m])",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus"
+          }
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "auth: goroutines",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "targets": [
+        {
+          "expr": "go_goroutines{job=\"auth\"}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus"
+          }
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "auth: heap in use",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        }
+      },
+      "targets": [
+        {
+          "expr": "go_memstats_heap_alloc_bytes{job=\"auth\"}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus"
+          }
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "auth: backend read/write avg latency",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 12,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      },
+      "targets": [
+        {
+          "expr": "(rate(backend_read_seconds_sum{job=\"auth\"}[1m]) + rate(backend_write_seconds_sum{job=\"auth\"}[1m])) / (rate(backend_read_seconds_count{job=\"auth\"}[1m]) + rate(backend_write_seconds_count{job=\"auth\"}[1m]))",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus"
+          }
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "auth: cache stale-event rate",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 16,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(teleport_cache_stale_events{job=\"auth\"}[5m]) / rate(teleport_cache_events{job=\"auth\"}[5m])",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus"
+          }
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "auth: gRPC error rate",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 12,
+        "y": 16,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(grpc_server_handled_total{job=\"auth\",grpc_code!=\"OK\"}[1m])) / sum(rate(grpc_server_handled_total{job=\"auth\"}[1m]))",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus"
+          }
+        }
+      ]
+    }
+  ]
+}

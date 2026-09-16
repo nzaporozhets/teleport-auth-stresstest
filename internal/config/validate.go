@@ -176,6 +176,9 @@ func (c *Config) validateObservability(v *ValidationError) {
 		if s.Interval <= 0 {
 			v.add("observability.scrape[%d].interval must be > 0", i)
 		}
+		if s.Cores < 0 {
+			v.add("observability.scrape[%d].cores must be >= 0 (0 means \"unset, default to 1\")", i)
+		}
 		names[s.Name] = true
 	}
 
