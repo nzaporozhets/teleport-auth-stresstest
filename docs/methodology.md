@@ -45,12 +45,24 @@ pass, not milestone-gated by name in instructions.md*.
 
 ## 3. Built-in per-IP rate limiting
 
-Implemented (M2/M3): `internal/scenario.ClassifyError` maps a
-`LimitExceededError` (gRPC `ResourceExhausted`, or HTTP 429 via
+Implemented (M2/M3), confirmed live: `internal/scenario.ClassifyError`
+maps a `LimitExceededError` (gRPC `ResourceExhausted`, or HTTP 429 via
 `trace.ReadError`) to the dedicated `RateLimited` outcome, distinct from
-generic server errors, for both transports. The runbook
-(`docs/runbook.md`) documents which cluster settings to raise before a
-ramp, and states that raising them is part of test setup, not cheating.
+generic server errors, for both transports. Confirmed against a real
+cluster (2026-09-16, `teleport2.cavj.dev`, v18.10.4): 4 RPS of
+`local-login-webauthn` from one source IP produced a flood of 429s,
+correctly classified as `rate-limited`. **Correction**: earlier drafts
+of this note (and `docs/runbook.md`) said the runbook "documents which
+cluster settings to raise" — that was speculative and turned out wrong
+for the specific limiter this scenario hits. Reading the pinned v17.7.29
+source (`lib/web/apiserver.go`'s `h.limiter` on
+`/webapi/mfa/login/{begin,finish}`) shows it's built from hardcoded
+constants (`lib/defaults/defaults.go`: 20 req/min, burst 40, per source
+IP), not from any `teleport.yaml`/Helm-configurable field. See
+`docs/runbook.md`'s "per-IP login-endpoint rate limiter" note for the
+real implication: source-IP diversity (multiple pods), not a config
+change, is the actual fix — matching what M5's multi-pod design already
+assumed for unrelated reasons.
 
 ## 4. Client-side key generation is not server work
 

@@ -20,14 +20,29 @@ touching dependencies, that's the cause).
    exactly `"I am not in production"`. This is enforced, not just
    documented — see `internal/config/validate.go` and
    `internal/identity/admin.go`.
-2. **Raise the proxy's per-IP rate limits before a ramp, deliberately.**
-   Teleport's built-in connection/request limiting will otherwise engage
-   long before the auth service itself saturates, and the run will
-   measure the limiter instead of the cluster. Raising these limits for a
-   load test is part of test setup, not cheating — see domain constraint
-   #3 in `docs/methodology.md`. *(Exact Helm values / config keys to set
-   are pending M5/M6, once the harness scrapes live `/metrics` to confirm
-   which limiter is actually engaging.)*
+2. **The proxy's per-IP login-endpoint rate limiter is not raisable via
+   config — plan for source-IP diversity instead.** Verified against the
+   pinned v17.7.29 source (confirmed live against a real v18.10.4
+   cluster, see below): the limiter guarding `/webapi/mfa/login/begin`
+   and `/webapi/mfa/login/finish` (`lib/web/apiserver.go`'s `h.limiter`,
+   comment: *"used to limit unauthenticated challenge generation for
+   passwordless and for unauthenticated metrics"*) is built from
+   **hardcoded constants** — `lib/defaults/defaults.go`:
+   `LimiterAverage = 20` requests/minute, `LimiterBurst = 40`, per source
+   IP — not from `teleport.yaml`/Helm values. Teleport's documented
+   `connection_limits` config field is real but feeds a *different,*
+   lower-level connection limiter, not this one. **This means a
+   single-source-IP generator will hit this limiter at roughly
+   0.33 sustained req/sec no matter what you set in the cluster config**
+   — the only real fix is exactly what M5's multi-pod design already
+   assumes: distribute load across genuinely different source IPs
+   (separate pods on separate nodes/egress paths), not raise a setting.
+   Earlier drafts of this runbook speculated this was configurable
+   without having verified it — it isn't, at least for this specific
+   endpoint limiter; corrected here after hitting it on a real cluster.
+   *(Other limiters — e.g. on authenticated gRPC endpoints — may behave
+   differently; not yet checked. If you find one that reads from cluster
+   config, update this note.)*
 3. **Check audit backend headroom.** Every login and cert issuance writes
    audit events; a long high-rate ramp can produce a large volume. Check
    your audit backend's (S3/Firestore/DynamoDB/etc.) write capacity and
@@ -223,11 +238,42 @@ helm install teleport-cluster teleport/teleport-cluster \
 make kind-down
 ```
 
-*Not verified end-to-end in this repo's development environment* — the
-sandbox this was built in has no Docker/kind/kubectl available (it does
-have Helm, used above for `helm lint`/`helm template` only), so none of
-M1's through M5's acceptance criteria have been run against a real
-cluster. Each is checked at the unit level only:
+### Live spot-check (2026-09-16, teleport2.cavj.dev, Teleport v18.10.4)
+
+Not a substitute for the full M1-M5 acceptance criteria below (small
+scale, single pod, single run, and a different major version than this
+toolkit is pinned to — v18.10.4 vs. the v17.7.29 the client code is
+written against), but real signal from a real cluster:
+
+- `authseed apply -y`: seeded 5 real local WebAuthn users. The soft
+  WebAuthn registration ceremony (`internal/identity/webauthn_soft.go`)
+  was accepted by a live v18.10.4 auth server, not just our own
+  `go-webauthn`-based tests.
+- `authload run local-login-webauthn -y`: real password+WebAuthn HTTP
+  logins against the live proxy, certs issued back. A clean run (rate
+  kept under the login endpoint's per-IP limiter, see below) got 23/23
+  success, p50/p99 ≈ 257/310ms.
+- Rate-limiter classification: a faster run (4 RPS from one source IP)
+  correctly classified the resulting flood of 429s as `rate-limited`,
+  distinct from other error classes — see the corrected limiter note
+  below, discovered by hitting it for real.
+- `cert-renewal`: failed cleanly with `access denied: impersonation is
+  not allowed` when the admin identity's role lacked an `impersonate`
+  grant — expected, and the error surfaced clearly rather than hanging
+  or being miscategorized.
+- The v17.7.29-pinned client interoperated with the live v18.10.4 server
+  without issue for every call made above (`Ping`, `GetUsers`,
+  `UpsertUser`/`UpsertRole`/`CreateResetPasswordToken`/
+  `CreateRegisterChallenge`/`ChangeUserAuthentication`, the web login
+  endpoints, `GenerateUserCerts`). Not exhaustive — only what got
+  exercised — but zero version-skew issues hit so far.
+
+*Not verified end-to-end at the scale/rigor the milestones actually
+require* — the sandbox this was built in has no Docker/kind/kubectl
+available (it does have Helm, used above for `helm lint`/`helm template`
+only), so none of M1's through M5's full acceptance criteria have been
+run. Each is checked at the unit level only, plus the live spot-check
+above for the pieces it touched:
 - M1 ("seeds 1,000 WebAuthn users against a kind-based Teleport cluster
   in under two minutes"): `internal/identity/*_test.go` verifies the soft
   WebAuthn/TOTP authenticators against the real
