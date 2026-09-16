@@ -1,0 +1,191 @@
+# teleport-auth-stress
+
+A breaking-point stress toolkit for Teleport authentication: it drives
+login and certificate-issuance load against a self-hosted, Kubernetes
+(Helm) Teleport cluster and produces a repeatable answer to "what's the
+maximum sustainable rate, what breaks first, and what's the server-side
+evidence for that."
+
+The deliverable is not a benchmark number — it's a knee point, a named
+limiting resource, and the evidence behind that attribution. See
+[`instructions.md`](instructions.md) for the full project spec this
+toolkit was built against, and [`CLAUDE.md`](CLAUDE.md) for the engineering
+conventions followed while building it.
+
+**Pinned Teleport version:** `v17.7.29` (commit
+`f11aeb122c9351028dd6e8c06b48094ab0dc91ee`). Metric names and API
+signatures differ across majors — this toolkit is written against the
+source at this exact commit, not against assumptions from other
+versions. See [`docs/methodology.md`](docs/methodology.md) for how it's
+pinned and why.
+
+## Status: M0–M5 complete, M6–M7 not started
+
+| Milestone | What | Status |
+|---|---|---|
+| M0 | Config schema, validation, guardrails, CLI skeleton | Done |
+| M1 | `authseed apply`/`teardown` — users, roles, MFA devices, keypair pool | Done |
+| M2 | Open/closed-loop driver, error taxonomy, HDR collection, `cert-renewal` scenario | Done |
+| M3 | `local-login-webauthn` scenario, per-phase timing | Done |
+| M4 | Ramp/breaking-point logic, generator saturation, Markdown report | Done |
+| M5 | Multi-pod sharding, aggregation command, Helm chart | Done |
+| M6 | Server-side scraping, pprof capture, Grafana dashboard, attribution | **Not started** |
+| M7 | `local-login-totp`, `bot-join-renew`, `route-cert-issuance`, `mixed` scenarios | **Not started** |
+
+**Read this before trusting any acceptance-criteria claim below or in
+the milestone docs:** this codebase was built in a sandbox with no
+Docker, kind, or kubectl available — every milestone's *live-cluster*
+acceptance test (e.g. "seeds 1,000 users in under two minutes against a
+real cluster," "a ramp converges within 15% across three runs") is
+**unverified**. What *is* verified, thoroughly, is everything that
+doesn't require a live Teleport cluster: `go build`/`go vet`/`go test
+-race` are clean across every package, the soft WebAuthn/TOTP
+authenticators are checked against the real `go-webauthn`/`pquerna-otp`
+libraries (not just round-tripped against their own code), the HDR
+histogram merge is proven mathematically exact against ground truth, and
+the Helm chart renders correctly under `helm lint`/`helm template`. See
+each milestone's notes in [`docs/methodology.md`](docs/methodology.md)
+and the "not verified" sections of [`docs/runbook.md`](docs/runbook.md)
+for exactly what was and wasn't checked, and how.
+
+## Layout
+
+```
+cmd/
+  authload/     load generator — one process per pod
+  authseed/     fixture provisioning (users, roles, MFA devices, keypair pool)
+internal/
+  config/       YAML schema, validation, guardrails
+  identity/     admin client, keypair pool, soft WebAuthn/TOTP authenticators
+  scenario/     Scenario interface + implementations (cert-renewal, local-login-webauthn)
+  driver/       open/closed-loop arrival control
+  ramp/         step plan, abort criteria, knee detection, generator health
+  collect/      HDR histograms, error taxonomy, cross-pod merge
+  aggregate/    per-pod raw step persistence + fleet-wide merge (M5)
+  report/       JSON + Markdown report rendering
+  attrib/       limiting-resource attribution — placeholder, M6
+deploy/
+  helm/         harness Helm chart (seed/load/aggregate Jobs, RBAC, secrets)
+  grafana/      dashboard generated from live metrics — placeholder, M6
+scenarios/      example config
+docs/
+  methodology.md            how each domain constraint is handled, file:line-cited
+  runbook.md                operational how-to, what's verified vs. not
+  interpreting-results.md   what each report field/outcome means
+```
+
+## Quickstart
+
+Requires Go 1.25+ (the pinned Teleport `api` module's own `go.mod`
+requires it — see [Build gotchas](#build-gotchas) below).
+
+```
+go build -o bin/authload ./cmd/authload
+go build -o bin/authseed ./cmd/authseed
+# or: make build
+```
+
+### 1. Validate a config
+
+```
+bin/authload validate -c scenarios/example.yaml
+```
+
+Copy [`scenarios/example.yaml`](scenarios/example.yaml) and fill in
+`target`/`identity`/`fixtures` for your cluster. Every field is
+documented inline; the guardrail fields
+(`target.guardrail.requireClusterName`,
+`target.guardrail.confirmPhrase`) and `load.generatorLimits` are
+required with no safe default — the tool refuses to run without them,
+by design.
+
+### 2. Seed fixtures
+
+```
+bin/authseed apply -c config.yaml        # pre-flight summary only
+bin/authseed apply -c config.yaml -y     # actually creates users/roles/devices/keypool
+bin/authseed teardown -c config.yaml -y  # deletes only users matching fixtures.userPrefix
+```
+
+### 3. Run load
+
+```
+bin/authload run -c config.yaml -y
+```
+
+Runs the full ramp (warmup → step plan → JSON/Markdown report in
+`report.outputDir`). Only `load.scenario: cert-renewal` and
+`local-login-webauthn` are implemented (M7 adds the rest).
+
+### 4. Multi-pod
+
+```
+bin/authload run -c config.yaml -y --shard-index 0 --shard-count 8 \
+  --start-at 2026-01-01T00:00:00Z --results-dir /shared/results/raw
+# ... repeat for every shard index, then:
+bin/authload aggregate -c config.yaml --results-dir /shared/results/raw
+```
+
+Or via the Helm chart — see [`docs/runbook.md`](docs/runbook.md#multi-pod-runs-m5).
+
+## Documentation
+
+- [`docs/methodology.md`](docs/methodology.md) — how each of the seven
+  "critical domain constraints" from the spec is handled, with code
+  citations, plus per-milestone implementation notes (design decisions,
+  things that surprised us, config fields added beyond the original
+  sketch and why).
+- [`docs/runbook.md`](docs/runbook.md) — operational how-to (build
+  gotchas, guardrail checklist before touching a real cluster, seeding,
+  running, multi-pod/Helm deployment) and an explicit ledger of what's
+  verified vs. not, per milestone.
+- [`docs/interpreting-results.md`](docs/interpreting-results.md) — what
+  each outcome class, report field, and run-level verdict means and
+  which cluster knob it points at.
+
+## Testing
+
+```
+go test ./...              # unit tests, no cluster needed
+go test -race ./...        # same, with the race detector
+make integration-test      # placeholder — see note below
+```
+
+Every package has unit tests; several verify against real third-party
+libraries rather than just their own code — the soft WebAuthn
+authenticator is checked with `go-webauthn` (the same library Teleport's
+server uses), the soft TOTP authenticator with `pquerna/otp`, and the
+error taxonomy against the real `trace.WriteError`/`ReadError`/
+`trail.FromGRPC` translation paths. `internal/aggregate` and
+`internal/collect`'s histogram merge are checked against hand-computed
+ground truth, not just self-consistency.
+
+`make integration-test` is defined per the project's engineering
+standards (integration tests must be skippable via a build tag), but no
+`//go:build integration` test files exist yet — this sandbox has no
+Docker/kind to write and run them against. See
+[`docs/runbook.md`](docs/runbook.md) for the kind-cluster setup steps
+once you have Docker available.
+
+## Build gotchas
+
+- The pinned Teleport `api` module's own `go.mod` requires **Go
+  1.25.14+**, independent of whatever the root Teleport module declares
+  — don't assume the two agree.
+- `github.com/charlievieth/strcase` must be at **v0.0.6+** — older
+  versions panic at init against newer Go toolchains' Unicode tables.
+  Already pinned correctly in `go.mod`; this is a note for anyone
+  bumping dependencies.
+- The Teleport `api` module isn't published under a `/vNN` path for
+  majors beyond v1, so it's pinned via a pseudo-version
+  (`v0.0.0-20260909235331-f11aeb122c93`), the same trick Teleport's own
+  external consumers (e.g. `teleport-plugins`) use. See
+  [`docs/methodology.md`](docs/methodology.md#teleport-version-pin) for
+  exactly how that pseudo-version was derived, if you ever need to bump
+  the pin.
+
+See the [Guardrails](instructions.md#guardrails-non-negotiable) section
+of the spec for the non-negotiable safety properties this toolkit
+enforces (cluster-name confirmation, scoped user deletion, admin
+identity never touching the load path) — all implemented and tested;
+see `docs/methodology.md`'s "Guardrails" section for where.
