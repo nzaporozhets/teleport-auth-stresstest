@@ -11,10 +11,10 @@ import (
 	"path/filepath"
 	"time"
 
-	"teleport-auth-stress/internal/collect"
 	"teleport-auth-stress/internal/config"
 	"teleport-auth-stress/internal/driver"
 	"teleport-auth-stress/internal/identity"
+	"teleport-auth-stress/internal/ramp"
 	"teleport-auth-stress/internal/report"
 	"teleport-auth-stress/internal/scenario"
 )
@@ -179,48 +179,71 @@ func runLoad(configPath string, cfg *config.Config) error {
 		return sc.Execute(ctx)
 	})
 
-	arrival := driver.Arrival(cfg.Load.Arrival)
-	rate := cfg.Load.Ramp.StartRPS
+	plan := ramp.Plan{
+		StartRPS:     cfg.Load.Ramp.StartRPS,
+		StepRPS:      cfg.Load.Ramp.StepRPS,
+		StepDuration: cfg.Load.Ramp.StepDuration,
+		Warmup:       cfg.Load.Ramp.Warmup,
+		Settle:       cfg.Load.Ramp.Settle,
+		MaxRPS:       cfg.Load.Ramp.MaxRPS,
+	}
+	abort := ramp.AbortCriteria{
+		P99LatencyMs:         cfg.Load.Abort.P99LatencyMs,
+		ErrorRatePct:         cfg.Load.Abort.ErrorRatePct,
+		ThroughputDeficitPct: cfg.Load.Abort.ThroughputDeficitPct,
+		ConsecutiveBadSteps:  cfg.Load.Abort.ConsecutiveBadSteps,
+	}
+	thresholds := ramp.GeneratorThresholds{
+		MaxCPUPercent:     cfg.Load.GeneratorLimits.MaxCPUPercent,
+		MaxGoroutines:     cfg.Load.GeneratorLimits.MaxGoroutines,
+		MaxOpenFDs:        cfg.Load.GeneratorLimits.MaxOpenFDs,
+		MaxEphemeralConns: cfg.Load.GeneratorLimits.MaxEphemeralConns,
+	}
 
-	if warmup := cfg.Load.Ramp.Warmup; warmup > 0 {
-		slog.Info("warming up", "duration", warmup, "rate", rate)
-		if err := driver.RunOpenLoop(ctx, rate, arrival, warmup, task, func(driver.Sample) {}); err != nil {
-			return fmt.Errorf("warmup: %w", err)
+	startTime := time.Now().UTC()
+	result, err := ramp.Run(ctx, plan, abort, thresholds, driver.Arrival(cfg.Load.Arrival), task, ramp.NewOSHealthSampler(), func(s ramp.StepReport) {
+		slog.Info("step complete", "offeredRPS", s.OfferedRPS, "achievedRPS", s.Snapshot.AchievedRPS, "pass", s.Pass, "generatorLimited", s.GeneratorLimited, "failReasons", s.FailReasons)
+	})
+	if err != nil {
+		return fmt.Errorf("ramp: %w", err)
+	}
+	slog.Info("run complete", "outcome", result.Outcome, "breakingPointRPS", result.BreakingPointRPS, "reason", result.Reason)
+
+	r := report.FromRampResult(result, report.Meta{
+		HarnessVersion:  report.HarnessVersion,
+		GitSHA:          report.GitSHA(),
+		StartTime:       startTime,
+		Scenario:        string(cfg.Load.Scenario),
+		LoadModel:       string(cfg.Load.Model),
+		Arrival:         string(cfg.Load.Arrival),
+		TeleportVersion: serverVersion,
+		ClusterName:     clusterName,
+	}, fmt.Sprintf("authload run -c %s -y", configPath))
+
+	stamp := startTime.Format("20060102T150405Z")
+	fmt.Printf("\nOutcome: %s", result.Outcome)
+	if result.Outcome == ramp.Converged {
+		fmt.Printf(" (breaking point: %.1f RPS)", result.BreakingPointRPS)
+	} else if result.Reason != "" {
+		fmt.Printf(" (%s)", result.Reason)
+	}
+	fmt.Println()
+
+	for _, format := range cfg.Report.Formats {
+		switch format {
+		case config.ReportFormatJSON:
+			outPath := filepath.Join(cfg.Report.OutputDir, fmt.Sprintf("report-%s.json", stamp))
+			if err := report.WriteJSON(outPath, r); err != nil {
+				return fmt.Errorf("writing JSON report: %w", err)
+			}
+			fmt.Printf("JSON report written to %s\n", outPath)
+		case config.ReportFormatMarkdown:
+			outPath := filepath.Join(cfg.Report.OutputDir, fmt.Sprintf("report-%s.md", stamp))
+			if err := report.WriteMarkdown(outPath, r); err != nil {
+				return fmt.Errorf("writing Markdown report: %w", err)
+			}
+			fmt.Printf("Markdown report written to %s\n", outPath)
 		}
 	}
-
-	collector := collect.New()
-	slog.Info("running measured step", "duration", cfg.Load.Ramp.StepDuration, "rate", rate)
-	measuredStart := time.Now()
-	if err := driver.RunOpenLoop(ctx, rate, arrival, cfg.Load.Ramp.StepDuration, task, func(s driver.Sample) {
-		collector.Add(s.OpenLoopLatency(), s.Result.Outcome, s.Result.Bytes)
-	}); err != nil {
-		return fmt.Errorf("measured step: %w", err)
-	}
-	elapsed := time.Since(measuredStart)
-
-	snap := collector.Snapshot(rate, elapsed)
-	slog.Info("run complete", "summary", snap.String())
-
-	r := &report.Report{
-		Meta: report.Meta{
-			HarnessVersion:  report.HarnessVersion,
-			GitSHA:          report.GitSHA(),
-			StartTime:       measuredStart.UTC(),
-			Scenario:        string(cfg.Load.Scenario),
-			LoadModel:       string(cfg.Load.Model),
-			Arrival:         string(cfg.Load.Arrival),
-			TeleportVersion: serverVersion,
-			ClusterName:     clusterName,
-		},
-		Steps:        []report.Step{report.StepFromSnapshot(snap)},
-		ReproCommand: fmt.Sprintf("authload run -c %s -y", configPath),
-	}
-
-	outPath := filepath.Join(cfg.Report.OutputDir, fmt.Sprintf("report-%s.json", measuredStart.UTC().Format("20060102T150405Z")))
-	if err := report.WriteJSON(outPath, r); err != nil {
-		return fmt.Errorf("writing report: %w", err)
-	}
-	fmt.Printf("\n%s\nReport written to %s\n", snap.String(), outPath)
 	return nil
 }

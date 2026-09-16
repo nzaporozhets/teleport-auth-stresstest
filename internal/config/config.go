@@ -146,6 +146,11 @@ type LoadSpec struct {
 	Arrival  ArrivalProcess `yaml:"arrival"`
 	Ramp     Ramp           `yaml:"ramp"`
 	Abort    Abort          `yaml:"abort"`
+	// GeneratorLimits is not in instructions.md's original config
+	// sketch — added because domain constraint #7 (generator saturation)
+	// requires explicit thresholds to check the generator's own health
+	// against; there's no safe default we could silently apply instead.
+	GeneratorLimits GeneratorLimits `yaml:"generatorLimits"`
 }
 
 type Ramp struct {
@@ -162,6 +167,16 @@ type Abort struct {
 	ErrorRatePct         float64 `yaml:"errorRatePct"`
 	ThroughputDeficitPct float64 `yaml:"throughputDeficitPct"`
 	ConsecutiveBadSteps  int     `yaml:"consecutiveBadSteps"`
+}
+
+// GeneratorLimits are the thresholds beyond which the generator itself
+// is considered saturated (domain constraint #7). All four must be set:
+// there's no cluster-independent default that's safe for every pod size.
+type GeneratorLimits struct {
+	MaxCPUPercent     float64 `yaml:"maxCPUPercent"`
+	MaxGoroutines     int     `yaml:"maxGoroutines"`
+	MaxOpenFDs        int     `yaml:"maxOpenFDs"`
+	MaxEphemeralConns int     `yaml:"maxEphemeralConns"`
 }
 
 type Observability struct {

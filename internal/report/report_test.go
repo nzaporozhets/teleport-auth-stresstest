@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"teleport-auth-stress/internal/collect"
+	"teleport-auth-stress/internal/ramp"
 	"teleport-auth-stress/internal/scenario"
 )
 
@@ -74,4 +76,98 @@ func TestWriteJSON_RoundTrip(t *testing.T) {
 
 func TestGitSHA_DoesNotPanic(t *testing.T) {
 	_ = GitSHA() // may be "" in a test binary; just must not panic
+}
+
+func TestFromRampResult_Converged(t *testing.T) {
+	c := collect.New()
+	c.Add(10*time.Millisecond, scenario.Success, 0)
+	snap := c.Snapshot(100, time.Second)
+
+	result := &ramp.Result{
+		Steps:            []ramp.StepReport{{OfferedRPS: 100, Snapshot: snap, Pass: true}},
+		Outcome:          ramp.Converged,
+		BreakingPointRPS: 100,
+	}
+	r := FromRampResult(result, Meta{Scenario: "cert-renewal"}, "repro")
+
+	if r.Outcome != "converged" {
+		t.Errorf("Outcome = %q, want converged", r.Outcome)
+	}
+	if r.BreakingPointRPS == nil || *r.BreakingPointRPS != 100 {
+		t.Errorf("BreakingPointRPS = %v, want pointer to 100", r.BreakingPointRPS)
+	}
+	if len(r.Steps) != 1 || !r.Steps[0].Pass {
+		t.Errorf("Steps = %+v, want one passing step", r.Steps)
+	}
+}
+
+func TestFromRampResult_GeneratorLimited_NoBreakingPoint(t *testing.T) {
+	c := collect.New()
+	c.Add(10*time.Millisecond, scenario.Success, 0)
+	snap := c.Snapshot(100, time.Second)
+
+	result := &ramp.Result{
+		Steps:   []ramp.StepReport{{OfferedRPS: 100, Snapshot: snap, GeneratorLimited: true}},
+		Outcome: ramp.GeneratorLimited,
+		Reason:  "generator saturated",
+	}
+	r := FromRampResult(result, Meta{}, "repro")
+
+	if r.Outcome != "generator-limited" {
+		t.Errorf("Outcome = %q, want generator-limited", r.Outcome)
+	}
+	if r.BreakingPointRPS != nil {
+		t.Errorf("BreakingPointRPS = %v, want nil when generator-limited", *r.BreakingPointRPS)
+	}
+	if r.OutcomeReason != "generator saturated" {
+		t.Errorf("OutcomeReason = %q, want %q", r.OutcomeReason, "generator saturated")
+	}
+	if !r.Steps[0].GeneratorLimited {
+		t.Error("expected step to carry GeneratorLimited=true")
+	}
+}
+
+func TestWriteMarkdown(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "report.md")
+
+	bp := 400.0
+	r := &Report{
+		Meta: Meta{
+			Scenario:  "cert-renewal",
+			LoadModel: "open",
+			Arrival:   "poisson",
+			StartTime: time.Now().UTC(),
+		},
+		Steps: []Step{
+			{OfferedRPS: 200, AchievedRPS: 200, Pass: true},
+			{OfferedRPS: 400, AchievedRPS: 380, Pass: true},
+			{OfferedRPS: 600, AchievedRPS: 300, Pass: false, FailReasons: []string{"p99 latency 5000.0ms exceeds threshold 2000.0ms"}},
+		},
+		Outcome:          "converged",
+		BreakingPointRPS: &bp,
+		ReproCommand:     "authload run -c scenarios/example.yaml -y",
+	}
+
+	if err := WriteMarkdown(path, r); err != nil {
+		t.Fatalf("WriteMarkdown: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading written markdown: %v", err)
+	}
+	out := string(data)
+
+	for _, want := range []string{
+		"# teleport-auth-stress report",
+		"cert-renewal",
+		"CONVERGED",
+		"Breaking point: **400.0 RPS**",
+		"p99 latency 5000.0ms exceeds threshold 2000.0ms",
+		"authload run -c scenarios/example.yaml -y",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rendered markdown missing %q; got:\n%s", want, out)
+		}
+	}
 }

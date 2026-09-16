@@ -1,9 +1,9 @@
 # Interpreting results
 
 This document explains what each failure class in a report usually means
-and which cluster knob it points at. It will grow as scenarios (M2+),
-the ramp/attribution logic (M4/M6), and the report format (M4) land —
-for now it covers the taxonomy already implemented.
+and which cluster knob it points at. It will grow as the remaining
+scenarios (M7) and attribution (M6) land — for now it covers the
+taxonomy, ramp outcomes, and report shape already implemented.
 
 ## Outcome classes (`internal/scenario.Outcome`)
 
@@ -16,16 +16,18 @@ and `docs/methodology.md`'s note on `trace.WriteError`/`ReadError`.
 - **Lockout** — the target user was locked out after too many consecutive
   failed auth attempts. This is *not* a latency or capacity signal: once a
   ramp starts producing real errors, lockouts cascade and can make an
-  unrelated problem look like a wave of auth failures. **Current state
-  (M3): lockouts are classified into this distinct outcome, but
-  `collect.Snapshot.ErrorRatePct` still counts them in the error rate,
-  and nothing retires a locked-out user from the pool yet** — both are
-  ramp-controller responsibilities, pending M4. Until then, if you see
-  nonzero `lockout` counts in a report, subtract them from the error rate
-  by hand before judging abort thresholds. Points at: too-aggressive
-  abort thresholds causing repeated failed logins on the same seeded
-  users, or a scenario bug re-using stale credentials. It does *not*
-  point at cluster capacity.
+  unrelated problem look like a wave of auth failures. A step's reported
+  `errorRatePct` includes lockouts (informational, raw rate); the
+  separate `abortErrorRatePct` field excludes them, and it's
+  `abortErrorRatePct` — not `errorRatePct` — that decides whether a step
+  passes (M4, `internal/ramp.evaluateStep`). If `errorRatePct` and
+  `abortErrorRatePct` diverge a lot in a report, most of your "errors"
+  are lockouts, not a real problem — nothing currently retires a
+  locked-out user from the pool, though, so it'll keep getting retried
+  and keep failing until the run ends. Points at: too-aggressive abort
+  thresholds causing repeated failed logins on the same seeded users, or
+  a scenario bug re-using stale credentials. It does *not* point at
+  cluster capacity.
 - **RateLimited** — the target's built-in per-IP connection/request
   limiter engaged. Points at: `proxy_limiter`/connection-limit settings
   being too low for the offered rate from your generator pod IPs — raise
@@ -60,26 +62,30 @@ directly). The three should sum to very close to the scenario's total
 doing unmeasured work, which is exactly what M3's "phase timings sum to
 within 5%" acceptance criterion exists to catch.
 
-## Generator health
+## Generator health and run outcomes (M4)
 
 A breaking point is only meaningful if the load generator wasn't the
-thing that broke first (domain constraint #7). Once the ramp package
-(M4) lands, a run that crosses a generator CPU/goroutine/FD/ephemeral-port
-threshold will be marked `generator-limited` in the report instead of
-reporting a cluster breaking point — treat that result as "inconclusive,
-re-run with more generator capacity or more pods," not as a finding about
-the cluster.
+thing that broke first (domain constraint #7). Every step's report entry
+carries `generatorHealth` (worst-observed CPU%/goroutines/FDs/ephemeral
+connections during that step) and `generatorLimited` (whether any of
+those crossed `load.generatorLimits`). If *any* step in a run is
+generator-limited, the whole run's `outcome` is `"generator-limited"` and
+`breakingPointRPS` is omitted, even if earlier steps looked like clean
+passes — treat that result as "inconclusive, re-run with more generator
+capacity or more pods," not as a finding about the cluster. A run's
+`outcome` is one of:
 
-## Report shape (M2)
+- `"converged"` — at least one step passed, the generator was never
+  saturated, and the run stopped on `consecutiveBadSteps` or `maxRPS`.
+  `breakingPointRPS` is the highest offered rate whose step passed.
+- `"generator-limited"` — see above. No breaking point is reported.
+- `"inconclusive"` — no step ever passed, including the very first one
+  at `load.ramp.startRPS`. Either `startRPS` already exceeds the
+  cluster's limit, or the abort thresholds are stricter than the cluster
+  can ever satisfy — check `load.abort` before assuming the cluster is
+  actually this fragile.
 
-`authload run`'s JSON report has `meta` (harness/git/cluster/scenario
-identity), `steps` (currently always exactly one — the ramp's multi-step
-table is M4), and `reproCommand`. Each step's `outcomes` map is keyed by
-the `Outcome.String()` values above (`"success"`, `"lockout"`,
-`"rate-limited"`, `"timeout"`, `"server-error"`, `"client-error"`).
-Percentiles (`p50Ms`/`p90Ms`/`p99Ms`/`p999Ms`) come from a full-fidelity
-HDR histogram, not fixed buckets, and are computed over *every* completed
-call regardless of outcome — a slow failure still shows up in the tail.
+`outcomeReason` is populated for the latter two and explains which.
 
 ## Coordinated omission
 

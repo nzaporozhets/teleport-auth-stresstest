@@ -82,16 +82,28 @@ type Snapshot struct {
 	P999        time.Duration
 }
 
-// ErrorRatePct is the percentage of samples that were not Success. Per
-// domain constraint #2, callers that need an abort-criteria error rate
-// must exclude Lockout themselves (this method reports the raw rate; the
-// ramp package, M4, is responsible for the exclusion when it lands).
+// ErrorRatePct is the percentage of samples that were not Success. This
+// is the raw, informational rate for reports; the ramp package (M4)
+// uses AbortErrorRatePct, not this, to decide whether a step passes.
 func (s Snapshot) ErrorRatePct() float64 {
 	if s.Total == 0 {
 		return 0
 	}
 	errors := s.Total - s.Outcomes[scenario.Success]
 	return 100 * float64(errors) / float64(s.Total)
+}
+
+// AbortErrorRatePct is ErrorRatePct with Lockout excluded. Domain
+// constraint #2: once a ramp starts producing errors, lockouts cascade
+// and would turn a latency/capacity problem into a fake wall of
+// authentication failures if they counted toward the rate that drives
+// abort criteria — so they must not.
+func (s Snapshot) AbortErrorRatePct() float64 {
+	if s.Total == 0 {
+		return 0
+	}
+	nonAbortErrors := s.Total - s.Outcomes[scenario.Success] - s.Outcomes[scenario.Lockout]
+	return 100 * float64(nonAbortErrors) / float64(s.Total)
 }
 
 // Snapshot summarizes the run so far. offeredRPS is the configured

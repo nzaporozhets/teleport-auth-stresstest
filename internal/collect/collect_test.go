@@ -49,6 +49,27 @@ func TestCollector_SnapshotBasics(t *testing.T) {
 	}
 }
 
+func TestCollector_AbortErrorRatePct_ExcludesLockout(t *testing.T) {
+	c := New()
+	for i := 0; i < 80; i++ {
+		c.Add(10*time.Millisecond, scenario.Success, 0)
+	}
+	for i := 0; i < 15; i++ {
+		c.Add(10*time.Millisecond, scenario.Lockout, 0)
+	}
+	for i := 0; i < 5; i++ {
+		c.Add(10*time.Millisecond, scenario.ServerError, 0)
+	}
+	snap := c.Snapshot(100, time.Second)
+
+	if got, want := snap.ErrorRatePct(), 20.0; got != want {
+		t.Errorf("ErrorRatePct() = %v, want %v (includes lockouts)", got, want)
+	}
+	if got, want := snap.AbortErrorRatePct(), 5.0; got != want {
+		t.Errorf("AbortErrorRatePct() = %v, want %v (excludes lockouts)", got, want)
+	}
+}
+
 func TestCollector_EmptySnapshot(t *testing.T) {
 	c := New()
 	snap := c.Snapshot(20, time.Second)

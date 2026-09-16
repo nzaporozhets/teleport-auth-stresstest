@@ -144,6 +144,20 @@ func (c *Config) validateLoad(v *ValidationError) {
 	if a.ConsecutiveBadSteps < 1 {
 		v.add("load.abort.consecutiveBadSteps must be >= 1")
 	}
+
+	g := c.Load.GeneratorLimits
+	if g.MaxCPUPercent <= 0 {
+		v.add("load.generatorLimits.maxCPUPercent must be > 0 (domain constraint #7: the generator's own saturation must be checked explicitly)")
+	}
+	if g.MaxGoroutines <= 0 {
+		v.add("load.generatorLimits.maxGoroutines must be > 0")
+	}
+	if g.MaxOpenFDs <= 0 {
+		v.add("load.generatorLimits.maxOpenFDs must be > 0")
+	}
+	if g.MaxEphemeralConns <= 0 {
+		v.add("load.generatorLimits.maxEphemeralConns must be > 0")
+	}
 }
 
 func (c *Config) validateObservability(v *ValidationError) {

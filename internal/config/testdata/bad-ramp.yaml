@@ -36,6 +36,12 @@ load:
     throughputDeficitPct: 5
     consecutiveBadSteps: 2
 
+  generatorLimits:
+    maxCPUPercent: 80
+    maxGoroutines: 100000
+    maxOpenFDs: 50000
+    maxEphemeralConns: 50000
+
 observability:
   listen: :9100
   scrape:

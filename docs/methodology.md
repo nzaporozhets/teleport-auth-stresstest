@@ -30,12 +30,18 @@ self-consistency.
 across both transports this toolkit uses (gRPC, M2; the proxy web API's
 `trace.WriteError`/`ReadError` HTTP convention, M3 — see
 `internal/scenario/locallogin_test.go`'s `TestLocalLoginWebAuthn_Lockout`).
-`collect.Snapshot.ErrorRatePct` currently counts every non-`Success`
-outcome, including `Lockout`, in the error rate — *excluding* lockouts
-from the rate that drives abort criteria, and retiring a locked-out user
-from the pool, are ramp-level concerns and remain *pending: M4* (the
-`collect`/`ramp` split needed to do that scopes to the ramp controller,
-which doesn't exist yet).
+`collect.Snapshot.ErrorRatePct` counts every non-`Success` outcome,
+including `Lockout` — that's the raw, informational rate shown in
+reports. `collect.Snapshot.AbortErrorRatePct` (M4) excludes `Lockout`,
+and `internal/ramp.evaluateStep` uses that one, not `ErrorRatePct`, to
+decide pass/fail — so lockouts genuinely never drive abort criteria now
+(see `TestEvaluateStep/lockouts_don't_fail_the_error_rate_check`).
+**Retiring a locked-out user from the load pool is still not
+implemented** — no scenario currently tracks per-user lockout state, so
+a locked-out user keeps getting retried on its next round-robin turn.
+This only matters once a scenario reuses specific per-user credentials
+across repeated calls (`local-login-webauthn` does); *pending: a later
+pass, not milestone-gated by name in instructions.md*.
 
 ## 3. Built-in per-IP rate limiting
 
@@ -85,10 +91,17 @@ used.
 
 ## 7. Generator saturation
 
-The generator continuously samples its own CPU, goroutine count, open file
-descriptors, and ephemeral port usage. If any threshold is crossed, the run
-is marked `generator-limited` and no cluster breaking point is reported.
-*Pending: M4 (ramp package).*
+Implemented (M4). `internal/ramp.HealthSampler` (real implementation:
+`NewOSHealthSampler`, `/proc`-based — CPU via `/proc/self/stat`
+utime+stime deltas, goroutines via `runtime.NumGoroutine`, FDs via
+`/proc/self/fd`, ephemeral connections via `/proc/net/tcp{,6}`) is
+polled every 500ms during each step's measured window; the worst
+(max-per-field) reading is compared against `load.generatorLimits`. If
+*any* step crosses *any* threshold, the whole run's `Outcome` is
+`generator-limited` and `BreakingPointRPS` is withheld — not just that
+one step marked bad — per "refuse to report a cluster breaking point."
+`load.generatorLimits` has no safe default and is required in config
+validation (M0's guardrail-style "must be explicit" pattern).
 
 ## Guardrails (implemented, M0)
 
@@ -218,6 +231,52 @@ is marked `generator-limited` and no cluster breaking point is reported.
   sketch** — added because this HTTP path needs its own TLS trust
   decision (self-signed certs on a disposable kind/dev cluster), separate
   from however the gRPC clients trust the cluster.
+
+## M4 implementation notes
+
+- **Warmup vs. settle**: instructions.md says "warm-up, then each step
+  ... discarding the settle window after every rate change." Read as:
+  `load.ramp.warmup` is a one-time discard before the *first* step only;
+  `load.ramp.settle` is discarded before every *subsequent* step (since
+  every subsequent step is itself a rate change). `internal/ramp.Run`
+  implements exactly this — first iteration discards `Warmup`, every
+  later one discards `Settle`.
+- **A generator-limited step overrides an otherwise-passing verdict for
+  the whole run, not just that step.** `evaluateStep`'s abort-criteria
+  check and the generator-health check are independent, but
+  `runStep`'s `Pass` field is `pass && !limited`, and `Run` sets the
+  run-level `Outcome` to `GeneratorLimited` if *any* step was limited,
+  regardless of what later steps did — because a generator-limited
+  measurement can't be trusted as evidence either way. See
+  `TestRun_GeneratorLimited_OverridesOtherwisePassingStep`.
+- **Bisection between the last passing and first failing step is
+  optional per instructions.md and not implemented** — `Run` reports the
+  highest *stepped* passing rate as the breaking point, not a bisected
+  estimate. Revisit if the ±`stepRPS` granularity turns out to be too
+  coarse in practice.
+- **Generator health sampling is Linux-`/proc`-based, not cross-platform**
+  (the deployment target is Kubernetes pods per instructions.md's
+  "Distributed execution" section, always Linux) — CPU via
+  `/proc/self/stat` utime+stime deltas (assumes `USER_HZ`=100, true on
+  every mainstream Linux distro/arch; getting the exact value needs cgo,
+  not worth it for an approximate signal), FDs via `/proc/self/fd`,
+  ephemeral connections via `/proc/net/tcp{,6}` line counts (network-
+  namespace-wide, not strictly per-PID — an accepted approximation given
+  the one-process-per-pod deployment model). Every read degrades to a
+  zero reading on error rather than failing the run; a zero
+  `GeneratorThresholds` field means "don't check this metric," so this
+  can never spuriously trigger from an unavailable metric — it can only
+  under-report saturation on an unsupported platform, never over-report.
+- **`load.generatorLimits` has no safe default and is required** (like
+  `target.guardrail.confirmPhrase`) — there's no CPU/FD/goroutine ceiling
+  that's correct for every pod size, so config validation rejects a
+  config that omits it rather than silently disabling saturation
+  detection.
+- **The ramp/report boundary**: `internal/report` now imports
+  `internal/ramp` (`FromRampResult`, `StepFromRampReport`) — the first
+  cross-package dependency of that shape in this codebase. No cycle:
+  `ramp` depends only on `collect`/`driver`, neither of which depends on
+  `report`.
 
 ## Teleport version pin
 

@@ -79,12 +79,12 @@ password and WebAuthn/TOTP private material, plus the raw private keys of
 the pre-generated keypair pool. Treat it like the admin identity file:
 it's written with `0600` permissions, but it is not encrypted at rest.
 
-## Running load (M2/M3: cert-renewal, local-login-webauthn)
+## Running load (M2-M4: cert-renewal, local-login-webauthn, full ramp)
 
 ```
 authload validate -c scenarios/example.yaml
 authload run -c scenarios/example.yaml       # prints pre-flight summary, generates no load
-authload run -c scenarios/example.yaml -y    # runs the open-loop driver, writes a JSON report
+authload run -c scenarios/example.yaml -y    # runs the full ramp, writes JSON/Markdown reports
 ```
 
 `load.scenario` must be `cert-renewal` (M2) or `local-login-webauthn`
@@ -92,15 +92,26 @@ authload run -c scenarios/example.yaml -y    # runs the open-loop driver, writes
 fixtures or the cluster. `local-login-webauthn` needs
 `fixtures.secondFactor: webauthn`-seeded users in the fixture state (it
 skips any seeded user with a different second factor, and fails Setup if
-none match). The single step (no ramp yet — that's M4) runs at
-`load.ramp.startRPS` for `load.ramp.warmup` (discarded) then
-`load.ramp.stepDuration` (measured), using `load.model`/`load.arrival`.
-`load.model: closed` is implemented in `internal/driver` but this command
-currently refuses it, so a report can never accidentally end up unlabeled
-as to which model produced it.
+none match).
 
-The report JSON lands in `report.outputDir` as
-`report-<UTC timestamp>.json`.
+`authload run -y` (M4) runs the full step plan: warm up at
+`load.ramp.startRPS`, then each step at an increasing offered rate for
+`load.ramp.stepDuration`, discarding `load.ramp.settle` after every
+subsequent rate change, until `load.abort.consecutiveBadSteps` failures
+in a row or `load.ramp.maxRPS` is reached. `load.model: closed` is
+implemented in `internal/driver` but this command still refuses it, so a
+report can never accidentally end up unlabeled as to which model
+produced it. `load.generatorLimits` (all four sub-fields) is required —
+there's no cluster-independent default CPU/goroutine/FD/ephemeral-port
+ceiling that's safe to silently apply, so a config that omits it fails
+validation rather than quietly running without saturation detection.
+
+Reports land in `report.outputDir` as `report-<UTC timestamp>.{json,md}`,
+one file per format listed in `report.formats`. The JSON `outcome` field
+is `"converged"` (with a `breakingPointRPS`), `"generator-limited"`, or
+`"inconclusive"` — see docs/interpreting-results.md for what each means
+and docs/methodology.md's M4 notes for exactly how generator-limited
+overrides an otherwise-passing step.
 
 ## kind-based integration testing
 
@@ -124,8 +135,8 @@ make kind-down
 
 *Not verified end-to-end in this repo's development environment* — the
 sandbox this was built in has no Docker/kind/kubectl available, so none
-of M1's, M2's, or M3's acceptance criteria have been run against a real
-cluster. Each is checked at the unit level only:
+of M1's, M2's, M3's, or M4's acceptance criteria have been run against a
+real cluster. Each is checked at the unit level only:
 - M1 ("seeds 1,000 WebAuthn users against a kind-based Teleport cluster
   in under two minutes"): `internal/identity/*_test.go` verifies the soft
   WebAuthn/TOTP authenticators against the real
@@ -146,6 +157,17 @@ cluster. Each is checked at the unit level only:
   using the real `go-webauthn` library, and a lockout/rate-limit/
   connection-refused test built on the real `trace.WriteError`/`ReadError`
   pair Teleport itself uses.
+- M4 ("against an intentionally undersized cluster, a ramp converges on
+  a knee and reports the same value within 15% across three consecutive
+  runs"): `internal/ramp/ramp_test.go` verifies the step-plan control
+  flow (knee detection, generator-limited override, inconclusive
+  detection, warmup/settle discard timing) against synthetic tasks with
+  scripted degradation — deterministic by construction (degradation is
+  triggered via the `onStep` callback at an exact step boundary, not a
+  wall-clock guess, precisely to avoid the timing flakiness a naive
+  version of this test had during development). It does not and cannot
+  verify the 15%-reproducibility claim itself, which is a statement about
+  a real cluster's behavior under repeated load, not about this code.
 
-Re-run all three milestones' acceptance criteria against a real kind
+Re-run all four milestones' acceptance criteria against a real kind
 cluster before relying on any of these claims.
